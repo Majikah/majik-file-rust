@@ -5,7 +5,8 @@ edition = "2021"
 description = "Majik File is the core cryptographic engine for secure file handling in the Majikah ecosystem. It provides a post-quantum secure MJKB format designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms."
 license = "Apache-2.0"
 authors = ["Zelijah"]
-repository = "https://github.com/Majikah/majik-file"
+repository = "https://github.com/Majikah/majik-file-rust"
+readme = "README.md"   # points to your local README
 keywords = [
     "majikah",
     "majik-file",
