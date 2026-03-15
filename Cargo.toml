@@ -8,26 +8,11 @@ authors = ["Zelijah"]
 repository = "https://github.com/Majikah/majik-file-rust"
 readme = "README.md"   # points to your local README
 keywords = [
-    "majikah",
-    "majik-file",
-    "file-encryption",
-    "secure-files",
-    "cryptography",
     "post-quantum",
-    "post-quantum-cryptography",
     "ml-kem",
-    "key-encapsulation",
-    "hybrid-encryption",
-    "multi-recipient-encryption",
     "aes-gcm",
-    "secure-file-format",
-    "file-security",
-    "encrypted-files",
-    "compression",
+    "file-encryption",
     "zstd",
-    "wasm-crypto",
-    "mjkb",
-    "secure-storage",
 ]
 
 [lib]
