@@ -46,10 +46,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::crypto::crypto_provider::generate_ml_kem_keypair;
+use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::types::{
     CreateOptions, FileContext, MajikFileIdentity, MajikFileRecipient, TempFileDuration,
 };
-use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::utils::{format_bytes, infer_mime_type_from_filename, sha256_base64, sha256_hex};
 use crate::majik_file::MajikFile;
 
@@ -206,7 +206,10 @@ pub fn cmd_encrypt_file(req: EncryptRequest) -> Result<EncryptResult, String> {
     let json = file.to_json().map_err(|e| e.to_string())?;
     let metadata = serde_json::to_value(&json).map_err(|e| e.to_string())?;
 
-    Ok(EncryptResult { mjkb_bytes, metadata })
+    Ok(EncryptResult {
+        mjkb_bytes,
+        metadata,
+    })
 }
 
 /// Decrypt a .mjkb binary and return the plaintext bytes.

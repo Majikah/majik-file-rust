@@ -74,9 +74,7 @@ pub fn aes_gcm_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8
     cipher
         .encrypt(Nonce::from_slice(iv), plaintext)
         .map_err(|e| {
-            MajikFileError::encryption_failed(Some(Box::new(std::io::Error::other(
-                e.to_string(),
-            ))))
+            MajikFileError::encryption_failed(Some(Box::new(std::io::Error::other(e.to_string()))))
         })
 }
 
