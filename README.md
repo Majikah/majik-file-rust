@@ -363,7 +363,8 @@ fn main() {
 ```typescript
 import { invoke } from '@tauri-apps/api/core';
 
-// Encrypt. Request/response object fields use camelCase.
+// Encrypt. The request and result wrapper use camelCase; metadata follows the
+// MajikFileJson field names.
 const { mjkbBytes, metadata } = await invoke<{
   mjkbBytes: number[];
   metadata: object;
@@ -377,7 +378,6 @@ const { mjkbBytes, metadata } = await invoke<{
       mlKemPublicKey: Array.from(identity.mlKemPublicKey),
       mlKemSecretKey: Array.from(identity.mlKemSecretKey),
     },
-    context: 'user_upload',
     originalName: file.name,
     mimeType: file.type,
   },

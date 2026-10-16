@@ -4,7 +4,7 @@
 //!
 //! Drop these commands into your Tauri `src-tauri/src/main.rs`:
 //!
-//! ```rust
+//! ```ignore
 //! use majik_file::tauri_commands::*;
 //!
 //! fn main() {
@@ -31,15 +31,17 @@
 //!
 //! const { publicKey, secretKey } = await invoke('cmd_generate_ml_kem_keypair');
 //!
-//! const mjkbBytes = await invoke<number[]>('cmd_encrypt_file', {
-//!   data: Array.from(fileBytes),
-//!   userId: 'user-uuid',
-//!   identityFingerprint: fingerprint,
-//!   identityPublicKey: publicKeyString,
-//!   identityMlKemPublicKey: Array.from(mlKemPubKeyBytes),
-//!   identityMlKemSecretKey: Array.from(mlKemSecKeyBytes),
-//!   context: 'user_upload',
-//!   isTemporary: false,
+//! const { mjkbBytes, metadata } = await invoke('cmd_encrypt_file', {
+//!   req: {
+//!     data: Array.from(fileBytes),
+//!     userId: 'user-uuid',
+//!     identity: {
+//!       publicKey: publicKeyString,
+//!       fingerprint,
+//!       mlKemPublicKey: Array.from(mlKemPubKeyBytes),
+//!       mlKemSecretKey: Array.from(mlKemSecKeyBytes),
+//!     },
+//!   },
 //! });
 //! ```
 
@@ -48,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::crypto::crypto_provider::generate_ml_kem_keypair;
 use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::types::{
-    CreateOptions, FileContext, MajikFileIdentity, MajikFileRecipient, TempFileDuration,
+    MajikFileCreateOptions, MajikFileDecryptIdentity, MajikFileIdentity, MajikFileRecipient,
 };
 use crate::core::utils::{format_bytes, infer_mime_type_from_filename, sha256_base64, sha256_hex};
 use crate::majik_file::MajikFile;
@@ -56,7 +58,7 @@ use crate::majik_file::MajikFile;
 // ─── Serialisable DTOs ────────────────────────────────────────────────────────
 
 /// Passed from TypeScript → Rust for identity fields.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityPayload {
     pub public_key: String,
@@ -100,7 +102,7 @@ impl From<RecipientPayload> for MajikFileRecipient {
 }
 
 /// Result returned to TypeScript after a successful `cmd_generate_ml_kem_keypair`.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeypairResult {
     /// ML-KEM-768 public key (1184 bytes).
@@ -120,13 +122,12 @@ pub struct EncryptResult {
 }
 
 /// DTO used by the Tauri invoke call for encryption to avoid many positional parameters.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncryptRequest {
     pub data: Vec<u8>,
     pub user_id: String,
     pub identity: IdentityPayload,
-    pub context: String,
     #[serde(default)]
     pub original_name: Option<String>,
     #[serde(default)]
@@ -134,27 +135,13 @@ pub struct EncryptRequest {
     #[serde(default)]
     pub recipients: Vec<RecipientPayload>,
     #[serde(default)]
-    pub is_temporary: bool,
-    #[serde(default)]
-    pub is_shared: bool,
-    #[serde(default)]
-    pub conversation_id: Option<String>,
-    #[serde(default)]
-    pub chat_message_id: Option<String>,
-    #[serde(default)]
-    pub thread_message_id: Option<String>,
-    #[serde(default)]
-    pub thread_id: Option<String>,
-    #[serde(default)]
-    pub expires_at_days: Option<u8>,
-    #[serde(default)]
     pub compression_level: Option<i32>,
     #[serde(default)]
     pub bypass_size_limit: bool,
 }
 
 /// Result returned to TypeScript after a successful `cmd_decrypt_file_with_metadata`.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecryptWithMetadataResult {
     pub bytes: Vec<u8>,
@@ -178,31 +165,21 @@ pub fn cmd_generate_ml_kem_keypair() -> KeypairResult {
 /// Encrypt a file and return the .mjkb bytes + Supabase metadata.
 #[tauri::command]
 pub fn cmd_encrypt_file(req: EncryptRequest) -> Result<EncryptResult, String> {
-    let ctx = parse_context(&req.context)?;
-    let expires_at = parse_duration(req.expires_at_days);
-
-    let options = CreateOptions {
+    let options = MajikFileCreateOptions {
         data: req.data,
         user_id: req.user_id,
         identity: req.identity.into(),
-        context: ctx,
+        recipients: req.recipients.into_iter().map(Into::into).collect(),
         original_name: req.original_name,
         mime_type: req.mime_type,
-        recipients: req.recipients.into_iter().map(Into::into).collect(),
-        is_temporary: req.is_temporary,
-        is_shared: req.is_shared,
-        conversation_id: req.conversation_id,
-        chat_message_id: req.chat_message_id,
-        thread_message_id: req.thread_message_id,
-        thread_id: req.thread_id,
-        expires_at,
+        id: None,
         compression_level: req.compression_level,
         bypass_size_limit: req.bypass_size_limit,
-        ..Default::default()
+        compressor: None,
     };
 
     let file = MajikFile::create(options).map_err(|e| e.to_string())?;
-    let mjkb_bytes = file.to_mjkb().map_err(|e| e.to_string())?;
+    let mjkb_bytes = file.to_mjkb().map_err(|e| e.to_string())?.to_vec();
     let json = file.to_json().map_err(|e| e.to_string())?;
     let metadata = serde_json::to_value(&json).map_err(|e| e.to_string())?;
 
@@ -215,12 +192,13 @@ pub fn cmd_encrypt_file(req: EncryptRequest) -> Result<EncryptResult, String> {
 /// Decrypt a .mjkb binary and return the plaintext bytes.
 #[tauri::command]
 pub fn cmd_decrypt_file(
-    /// Raw .mjkb bytes fetched from R2.
     mjkb_bytes: Vec<u8>,
     fingerprint: String,
     ml_kem_secret_key: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
-    MajikFile::decrypt(&mjkb_bytes, &fingerprint, &ml_kem_secret_key).map_err(|e| e.to_string())
+    let ml_kem_secret_key = Zeroizing::new(ml_kem_secret_key);
+    let identity = MajikFileDecryptIdentity::new(&fingerprint, ml_kem_secret_key.as_slice());
+    MajikFile::decrypt(&mjkb_bytes, identity, None).map_err(|e| e.to_string())
 }
 
 /// Decrypt a .mjkb binary and return bytes + embedded filename + MIME type.
@@ -230,14 +208,15 @@ pub fn cmd_decrypt_file_with_metadata(
     fingerprint: String,
     ml_kem_secret_key: Vec<u8>,
 ) -> Result<DecryptWithMetadataResult, String> {
-    let (bytes, original_name, mime_type) =
-        MajikFile::decrypt_with_metadata(&mjkb_bytes, &fingerprint, &ml_kem_secret_key)
-            .map_err(|e| e.to_string())?;
+    let ml_kem_secret_key = Zeroizing::new(ml_kem_secret_key);
+    let identity = MajikFileDecryptIdentity::new(&fingerprint, ml_kem_secret_key.as_slice());
+    let decrypted = MajikFile::decrypt_with_metadata_from(&mjkb_bytes, identity, None, None)
+        .map_err(|e| e.to_string())?;
 
     Ok(DecryptWithMetadataResult {
-        bytes,
-        original_name,
-        mime_type,
+        bytes: decrypted.bytes,
+        original_name: decrypted.original_name,
+        mime_type: decrypted.mime_type,
     })
 }
 
@@ -269,27 +248,4 @@ pub fn cmd_format_bytes(bytes: u64) -> String {
 #[tauri::command]
 pub fn cmd_infer_mime_type(filename: String) -> Option<String> {
     infer_mime_type_from_filename(&filename).map(|s| s.to_string())
-}
-
-// ─── Internal helpers ────────────────────────────────────────────────────────
-
-fn parse_context(s: &str) -> Result<FileContext, String> {
-    match s {
-        "user_upload" => Ok(FileContext::UserUpload),
-        "chat_attachment" => Ok(FileContext::ChatAttachment),
-        "chat_image" => Ok(FileContext::ChatImage),
-        "thread_attachment" => Ok(FileContext::ThreadAttachment),
-        other => Err(format!("Invalid context: \"{other}\"")),
-    }
-}
-
-fn parse_duration(days: Option<u8>) -> TempFileDuration {
-    match days {
-        Some(1) => TempFileDuration::One,
-        Some(2) => TempFileDuration::Two,
-        Some(3) => TempFileDuration::Three,
-        Some(5) => TempFileDuration::Five,
-        Some(7) => TempFileDuration::Seven,
-        _ => TempFileDuration::Fifteen,
-    }
 }
