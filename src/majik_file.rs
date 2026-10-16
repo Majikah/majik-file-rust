@@ -1,109 +1,263 @@
-//! majik_file.rs
+//! majik_file.rs — `MajikFile`: post-quantum binary file encryption.
+//! Platform-agnostic: knows nothing about chat, threads or storage backends.
 //!
-//! Post-quantum binary file encryption for Majik Message.
-//! Complete 1:1 port of the TypeScript MajikFile class.
+//! ## Extensibility (replaces TS subclassing)
+//! Rust has no inheritance, so the TS protected static hooks become the
+//! [`MajikFileHooks`] trait, and a `MajikMessageFile` is expected to *compose*
+//! a `MajikFile` (`impl AsRef<MajikFile> / AsMut<MajikFile>`), calling
+//! [`MajikFile::encrypt_core`] with its own hooks and [`MajikFile::from_parts`]
+//! to build the base record. [`MajikFile::collect_errors`] is public so the
+//! subclass can append its own errors and fail once.
 //!
-//! Single-recipient:
-//!   ML-KEM encapsulate → sharedSecret → AES-256-GCM key.
+//! ## Signatures
+//! `@majikah/majik-signature` has no Rust port yet, so signing goes through
+//! the [`SignatureProvider`] trait; the file only stores the serialized
+//! signature string.
 //!
-//! Group (2+ recipients):
-//!   Random 32-byte AES key encrypts file once.
-//!   Per recipient: ML-KEM encapsulate → encryptedAesKey = aesKey XOR sharedSecret.
+//! ## .mjkb v2
+//! `[4 "MJKB"][1 ver][12 IV][4 len BE][payload JSON][AES-GCM ciphertext]`
+//! with the explicit `z` compression flag and optional `ca` algorithm tag.
 
-use crate::core::compressor::MajikCompressor;
-use crate::core::constants::{
-    R2Prefix, AES_KEY_LEN, IV_LENGTH, MAX_FILE_SIZE_BYTES, MJKB_MAGIC, ML_KEM_PK_LEN, ML_KEM_SK_LEN,
-};
-use crate::core::crypto::{
-    aes_gcm_decrypt, aes_gcm_encrypt, generate_random_bytes, ml_kem_decapsulate, ml_kem_encapsulate,
-};
-use crate::core::error::MajikFileError;
-use crate::core::types::{
-    CreateOptions, FileContext, MajikFileGroupKey, MajikFileIdentity, MajikFileJson,
-    MajikFileRecipient, MajikFileStats, MajikMessagePublicKey, MjkbGroupPayload, MjkbPayload,
-    MjkbSinglePayload, StorageType, TempFileDuration,
-};
-use crate::core::utils::{
-    array_to_base64, assert_recipient_limit, base64_to_bytes, build_chat_image_r2_key,
-    build_expiry_date, build_permanent_r2_key, build_temporary_r2_key, decode_mjkb,
-    deduplicate_recipients, derive_filename, encode_mjkb, format_bytes, generate_uuid,
-    infer_mime_type_from_filename, is_expired, is_mime_type_inline_viewable, sha256_base64,
-    sha256_hex, should_compress,
-};
+use std::any::Any;
+use std::borrow::Cow;
 
-// ─── MajikFile ────────────────────────────────────────────────────────────────
+use chrono::{SecondsFormat, Utc};
 
-/// Post-quantum binary file encryption — Rust port of the TypeScript MajikFile class.
+use crate::core::compressor::majik_compressor::{CompressionLevel, MajikCompressor, ZSTD_CODEC};
+use crate::core::crypto::constants::*;
+use crate::core::crypto::crypto_provider::{
+    aes_gcm_decrypt, aes_gcm_encrypt, generate_random_bytes, ml_kem_encapsulate,
+};
+use crate::core::crypto::zeroize::Zeroizing;
+use crate::core::error::{MajikFileError, Result};
+use crate::core::mjkb_codec::{decode_mjkb, encode_mjkb, resolve_aes_key_from_payload, MJKB_MAGIC};
+use crate::core::types::*;
+use crate::core::utils::*;
+use crate::core::validator::MajikFileValidator;
+
+/// MIME type used when exporting .mjkb bytes.
+pub const MJKB_MIME_TYPE: &str = "application/vnd.majikah.bundle";
+
+// ── Batch / core types ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct BatchDecryptError {
+    pub id: String,
+    pub reason: String,
+}
+
+/// Files are hydrated **in place**; `decrypted` lists their ids.
+#[derive(Debug, Clone)]
+pub struct BatchDecryptResult {
+    pub success: bool,
+    pub decrypted: Vec<String>,
+    pub errors: Vec<BatchDecryptError>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BatchLockResult {
+    pub locked: usize,
+    /// Files with nothing hydrated.
+    pub skipped: usize,
+}
+
+/// Internal shape returned by [`MajikFile::encrypt_core`].
+#[derive(Debug, Clone)]
+pub struct EncryptCoreResult {
+    pub binary: Vec<u8>,
+    pub iv_hex: String,
+    pub file_hash: String,
+    pub size_original: usize,
+    pub size_stored: usize,
+    pub resolved_mime_type: Option<String>,
+    pub participants: Vec<MajikKeyAddress>,
+    pub is_group: bool,
+    /// Set only when compressed AND a non-default codec was used.
+    pub compression_alg: Option<String>,
+}
+
+pub struct EncryptCoreInput<'a> {
+    pub data: &'a [u8],
+    pub identity: &'a MajikFileIdentity,
+    pub recipients: &'a [MajikFileRecipient],
+    pub original_name: Option<&'a str>,
+    pub mime_type: Option<&'a str>,
+    pub bypass_size_limit: bool,
+    pub compression_level: Option<i32>,
+    pub compressor: Option<&'a dyn CompressionCodec>,
+    /// Opaque passthrough to `MajikFileHooks::pre_process` (base ignores it).
+    pub pre_process_extra: Option<&'a dyn Any>,
+}
+
+pub struct PreProcessed<'a> {
+    pub bytes: Cow<'a, [u8]>,
+    pub mime_type: Option<String>,
+}
+
+/// Extension points a subclass-style wrapper may override.
+pub trait MajikFileHooks {
+    /// No-op by default.
+    fn pre_process<'a>(
+        &self,
+        raw: &'a [u8],
+        mime_type: Option<&str>,
+        _extra: Option<&dyn Any>,
+    ) -> Result<PreProcessed<'a>> {
+        Ok(PreProcessed {
+            bytes: Cow::Borrowed(raw),
+            mime_type: mime_type.map(str::to_string),
+        })
+    }
+    /// Mime-only policy by default.
+    fn resolve_compression_policy(&self, mime_type: Option<&str>) -> bool {
+        should_compress_mime(mime_type)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultHooks;
+impl MajikFileHooks for DefaultHooks {}
+
+/// Result of `decrypt_with_metadata`. `signature` is the stored serialized
+/// signature (not verified; pass it to a [`SignatureProvider`]).
+#[derive(Debug, Clone)]
+pub struct DecryptedWithMetadata {
+    pub bytes: Vec<u8>,
+    pub original_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CanDecryptMjkbOptions {
+    /// Force a full trial decrypt even on a group fingerprint match.
+    pub strict: bool,
+    pub compression: DecryptCompressionOptions,
+}
+
+fn now_iso() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn blank(s: &Option<String>) -> bool {
+    s.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true)
+}
+
+// ── MajikFile ──────────────────────────────────────────────────────────────
+
 pub struct MajikFile {
     id: String,
+    schema_version: u32,
+    kind: String,
     user_id: String,
-    r2_key: String,
     original_name: Option<String>,
     mime_type: Option<String>,
     size_original: u64,
     size_stored: u64,
     file_hash: String,
-    /// Hex-encoded 12-byte IV — mirrors Supabase `encryption_iv` column.
     encryption_iv: String,
-    storage_type: StorageType,
-    is_shared: bool,
-    share_token: Option<String>,
-    context: Option<FileContext>,
-    chat_message_id: Option<String>,
-    thread_message_id: Option<String>,
-    thread_id: Option<String>,
-    conversation_id: Option<String>,
-    participants: Vec<MajikMessagePublicKey>,
-    expires_at: Option<String>,
+    participants: Vec<MajikKeyAddress>,
+    kem_alg: String,
+    cipher_alg: String,
+    compression_level: Option<CompressionLevel>,
+    compression_alg: Option<String>,
     timestamp: Option<String>,
     last_update: Option<String>,
-    /// Derived from payload type at create/parse time.
     is_group: bool,
-    /// Encrypted .mjkb binary. NOT in JSON / Supabase — lives in R2 only.
+    signature: Option<String>,
+    /// Encrypted .mjkb binary. NOT serialised via `to_json()`.
     binary: Option<Vec<u8>>,
+    /// Runtime-only decrypted cache — wiped on drop / `secure_lock()`.
+    decrypted: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl AsRef<MajikFile> for MajikFile {
+    fn as_ref(&self) -> &MajikFile {
+        self
+    }
+}
+impl AsMut<MajikFile> for MajikFile {
+    fn as_mut(&mut self) -> &mut MajikFile {
+        self
+    }
+}
+
+impl std::fmt::Display for MajikFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MajikFile {{ id: {}, hash: {}…, size: {}, type: {}, signed: {} }}",
+            self.id,
+            self.file_hash.chars().take(8).collect::<String>(),
+            format_bytes(self.size_original),
+            if self.is_group { "group" } else { "single" },
+            self.is_signed()
+        )
+    }
+}
+
+impl std::fmt::Debug for MajikFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MajikFile")
+            .field("id", &self.id)
+            .field("file_hash", &self.file_hash)
+            .field("is_group", &self.is_group)
+            .field("has_binary", &self.binary.is_some())
+            .field("has_decrypted", &self.decrypted.is_some())
+            .finish()
+    }
 }
 
 impl MajikFile {
-    // ── Internal constructor ─────────────────────────────────────────────────
+    // ── Construction ───────────────────────────────────────────────────────
 
-    fn from_parts(json: MajikFileJson, binary: Option<Vec<u8>>, is_group: bool) -> Self {
-        Self {
+    /// Build + validate from a record (used by `create`, `from_json`, and by
+    /// wrapper types). TS: protected constructor + `validate()`.
+    pub fn from_parts(
+        json: MajikFileJson,
+        binary: Option<Vec<u8>>,
+        is_group: bool,
+    ) -> Result<Self> {
+        let f = Self {
             id: json.id,
+            schema_version: json.schema_version,
+            kind: json.kind,
             user_id: json.user_id,
-            r2_key: json.r2_key,
             original_name: json.original_name,
             mime_type: json.mime_type,
             size_original: json.size_original,
             size_stored: json.size_stored,
             file_hash: json.file_hash,
             encryption_iv: json.encryption_iv,
-            storage_type: json.storage_type,
-            is_shared: json.is_shared,
-            share_token: json.share_token,
-            context: json.context,
-            chat_message_id: json.chat_message_id,
-            thread_message_id: json.thread_message_id,
-            thread_id: json.thread_id,
-            conversation_id: json.conversation_id,
             participants: json.participants,
-            expires_at: json.expires_at,
+            kem_alg: json.kem_alg,
+            cipher_alg: json.cipher_alg,
+            compression_level: json.compression_level,
+            compression_alg: json.compression_alg,
             timestamp: json.timestamp,
             last_update: json.last_update,
             is_group,
+            signature: json.signature,
             binary,
-        }
+            decrypted: None,
+        };
+        f.validate()?;
+        Ok(f)
     }
 
-    // ── Getters ──────────────────────────────────────────────────────────────
+    // ── Getters ────────────────────────────────────────────────────────────
 
     pub fn id(&self) -> &str {
         &self.id
     }
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
     pub fn user_id(&self) -> &str {
         &self.user_id
-    }
-    pub fn r2_key(&self) -> &str {
-        &self.r2_key
     }
     pub fn original_name(&self) -> Option<&str> {
         self.original_name.as_deref()
@@ -123,35 +277,14 @@ impl MajikFile {
     pub fn encryption_iv(&self) -> &str {
         &self.encryption_iv
     }
-    pub fn storage_type(&self) -> &StorageType {
-        &self.storage_type
+    pub fn kem_alg(&self) -> &str {
+        &self.kem_alg
     }
-    pub fn is_shared(&self) -> bool {
-        self.is_shared
+    pub fn cipher_alg(&self) -> &str {
+        &self.cipher_alg
     }
-    pub fn share_token(&self) -> Option<&str> {
-        self.share_token.as_deref()
-    }
-    pub fn context(&self) -> Option<&FileContext> {
-        self.context.as_ref()
-    }
-    pub fn chat_message_id(&self) -> Option<&str> {
-        self.chat_message_id.as_deref()
-    }
-    pub fn thread_message_id(&self) -> Option<&str> {
-        self.thread_message_id.as_deref()
-    }
-    pub fn thread_id(&self) -> Option<&str> {
-        self.thread_id.as_deref()
-    }
-    pub fn conversation_id(&self) -> Option<&str> {
-        self.conversation_id.as_deref()
-    }
-    pub fn participants(&self) -> &[MajikMessagePublicKey] {
+    pub fn participants(&self) -> &[MajikKeyAddress] {
         &self.participants
-    }
-    pub fn expires_at(&self) -> Option<&str> {
-        self.expires_at.as_deref()
     }
     pub fn timestamp(&self) -> Option<&str> {
         self.timestamp.as_deref()
@@ -159,6 +292,30 @@ impl MajikFile {
     pub fn last_update(&self) -> Option<&str> {
         self.last_update.as_deref()
     }
+    pub fn compression_alg(&self) -> Option<&str> {
+        self.compression_alg.as_deref()
+    }
+    /// `None` when unset or 0 (TS: `level || null`).
+    pub fn compression_level(&self) -> Option<CompressionLevel> {
+        self.compression_level.filter(|l| *l != 0)
+    }
+
+    fn round3(v: f64) -> f64 {
+        (v * 1000.0).round() / 1000.0
+    }
+    pub fn size_kb(&self) -> f64 {
+        Self::round3(self.size_original as f64 / 1024.0)
+    }
+    pub fn size_mb(&self) -> f64 {
+        Self::round3(self.size_original as f64 / 1024f64.powi(2))
+    }
+    pub fn size_gb(&self) -> f64 {
+        Self::round3(self.size_original as f64 / 1024f64.powi(3))
+    }
+    pub fn size_tb(&self) -> f64 {
+        Self::round3(self.size_original as f64 / 1024f64.powi(4))
+    }
+
     pub fn has_binary(&self) -> bool {
         self.binary.is_some()
     }
@@ -168,503 +325,264 @@ impl MajikFile {
     pub fn is_single(&self) -> bool {
         !self.is_group
     }
-
-    /// Original file size in kilobytes (3 decimal places).
-    pub fn size_kb(&self) -> f64 {
-        (self.size_original as f64 / 1024.0 * 1000.0).round() / 1000.0
+    pub fn has_decrypted_file(&self) -> bool {
+        self.decrypted.is_some()
     }
-    /// Original file size in megabytes (3 decimal places).
-    pub fn size_mb(&self) -> f64 {
-        (self.size_original as f64 / 1024.0f64.powi(2) * 1000.0).round() / 1000.0
-    }
-    /// Original file size in gigabytes (3 decimal places).
-    pub fn size_gb(&self) -> f64 {
-        (self.size_original as f64 / 1024.0f64.powi(3) * 1000.0).round() / 1000.0
-    }
-    /// Original file size in terabytes (3 decimal places).
-    pub fn size_tb(&self) -> f64 {
-        (self.size_original as f64 / 1024.0f64.powi(4) * 1000.0).round() / 1000.0
+    /// Cached plaintext, if `decrypt_hydrate()` ran this session.
+    pub fn decrypted_file(&self) -> Option<&[u8]> {
+        self.decrypted.as_ref().map(|d| d.as_slice())
     }
 
-    // ── CREATE ───────────────────────────────────────────────────────────────
+    /// Serialized base64 signature. `None` when unsigned.
+    pub fn signature_raw(&self) -> Option<&str> {
+        self.signature.as_deref()
+    }
+    /// Non-blank signature attached. Does NOT verify.
+    pub fn is_signed(&self) -> bool {
+        !blank(&self.signature)
+    }
 
-    /// Encrypt a raw binary file and produce a MajikFile instance.
+    pub fn is_inline_viewable(&self) -> bool {
+        is_mime_type_inline_viewable(self.mime_type.as_deref())
+    }
+    pub fn safe_filename(&self) -> String {
+        derive_filename(&self.file_hash, self.original_name.as_deref())
+    }
+
+    // ── Encrypt core (shared with wrapper types) ───────────────────────────
+
+    /// hash → pre_process (hook) → compress (policy hook) → encrypt → encode.
     ///
-    /// Single-recipient (empty `recipients`):
-    ///   ML-KEM encapsulate → sharedSecret → AES-256-GCM key.
-    ///
-    /// Group (1+ entries in `recipients`):
-    ///   Random 32-byte AES key encrypts the file once.
-    ///   Owner + every recipient each get their own ML-KEM key entry.
-    ///   encryptedAesKey = aesKey XOR sharedSecret (one-time-pad).
-    ///
-    /// Mirrors `MajikFile.create()` in TypeScript.
-    pub fn create(options: CreateOptions) -> Result<MajikFile, MajikFileError> {
-        // ── Input validation ───────────────────────────────────────────────
-        if options.data.is_empty() {
-            return Err(MajikFileError::invalid_input("data is required"));
-        }
-        if options.user_id.trim().is_empty() {
-            return Err(MajikFileError::invalid_input("user_id is required"));
-        }
-        if options.identity.fingerprint.trim().is_empty() {
+    /// Zeroization: ML-KEM shared secrets and the random group AES key live
+    /// in `Zeroizing` buffers and are wiped on drop, even on early error.
+    pub fn encrypt_core(
+        input: &EncryptCoreInput<'_>,
+        hooks: &dyn MajikFileHooks,
+    ) -> Result<EncryptCoreResult> {
+        let raw = input.data;
+        MajikFileValidator::assert_non_empty_data(raw.len())?;
+        MajikFileValidator::assert_size_within_limit(
+            raw.len(),
+            MAX_FILE_SIZE_BYTES,
+            input.bypass_size_limit,
+        )?;
+        if input.identity.fingerprint.trim().is_empty() {
             return Err(MajikFileError::invalid_input(
                 "identity.fingerprint is required",
             ));
         }
-        if options.identity.ml_kem_public_key.len() != ML_KEM_PK_LEN {
-            return Err(MajikFileError::invalid_input(format!(
-                "identity.ml_kem_public_key must be a {ML_KEM_PK_LEN}-byte Vec<u8>"
-            )));
-        }
-        if matches!(options.context, FileContext::ChatImage)
-            && options
-                .conversation_id
-                .as_deref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-        {
-            return Err(MajikFileError::invalid_input(
-                "conversation_id is required when context is ChatImage",
-            ));
-        }
-        if options.chat_message_id.is_some() && options.thread_message_id.is_some() {
-            return Err(MajikFileError::invalid_input(
-                "chat_message_id and thread_message_id are mutually exclusive",
-            ));
-        }
-
-        for (i, r) in options.recipients.iter().enumerate() {
+        MajikFileValidator::assert_ml_kem_public_key(
+            Some(&input.identity.ml_kem_public_key),
+            "identity.mlKemPublicKey",
+        )?;
+        for (i, r) in input.recipients.iter().enumerate() {
             if r.fingerprint.trim().is_empty() {
                 return Err(MajikFileError::invalid_input(format!(
                     "recipients[{i}].fingerprint is required"
                 )));
             }
-            if r.ml_kem_public_key.len() != ML_KEM_PK_LEN {
-                return Err(MajikFileError::invalid_input(format!(
-                    "recipients[{i}].ml_kem_public_key must be {ML_KEM_PK_LEN} bytes"
-                )));
+            MajikFileValidator::assert_ml_kem_public_key(
+                Some(&r.ml_kem_public_key),
+                &format!("recipients[{i}].mlKemPublicKey"),
+            )?;
+        }
+
+        // Hash the ORIGINAL bytes so dedup is stable regardless of preprocessing.
+        let file_hash = sha256_hex(raw);
+
+        let PreProcessed {
+            bytes: processed,
+            mime_type: resolved_mime,
+        } = hooks.pre_process(raw, input.mime_type, input.pre_process_extra)?;
+
+        let compress = hooks.resolve_compression_policy(resolved_mime.as_deref());
+        let codec: &dyn CompressionCodec = input.compressor.unwrap_or(&ZSTD_CODEC);
+        let compressed: Cow<[u8]> = if compress {
+            Cow::Owned(codec.compress(&processed, input.compression_level)?)
+        } else {
+            processed
+        };
+        // Tag only non-default codecs → default output stays byte-identical to TS.
+        let compression_alg = if compress && codec.alg() != COMPRESSION_SUITE.alg {
+            Some(codec.alg().to_string())
+        } else {
+            None
+        };
+
+        let iv = generate_random_bytes(IV_LENGTH)?;
+        let iv_hex = hex::encode(&iv);
+
+        let cleaned = deduplicate_recipients(input.recipients, &input.identity.fingerprint);
+        MajikFileValidator::assert_recipient_limit(cleaned.len(), MAX_GROUP_RECIPIENTS)?;
+
+        let mut all: Vec<MajikFileRecipient> = Vec::with_capacity(cleaned.len() + 1);
+        all.push(MajikFileRecipient {
+            fingerprint: input.identity.fingerprint.clone(),
+            ml_kem_public_key: input.identity.ml_kem_public_key.clone(),
+            public_key: input.identity.public_key.clone(),
+        });
+        all.extend(cleaned);
+        let participants: Vec<MajikKeyAddress> = all.iter().map(|r| r.public_key.clone()).collect();
+        let is_group = all.len() > 1;
+
+        let n = input.original_name.map(str::to_string);
+        let m = resolved_mime.clone();
+
+        let (ciphertext, payload) = if !is_group {
+            let enc = ml_kem_encapsulate(&input.identity.ml_kem_public_key)?;
+            let ct = aes_gcm_encrypt(&enc.shared_secret, &iv, &compressed)?;
+            (
+                ct,
+                MjkbPayload::Single(MjkbSinglePayloadV2 {
+                    ml_kem_cipher_text: array_to_base64(&enc.cipher_text),
+                    n,
+                    m,
+                    z: compress,
+                    ca: compression_alg.clone(),
+                }),
+            )
+        } else {
+            let aes_key = Zeroizing::new(generate_random_bytes(AES_KEY_LEN)?);
+            let ct = aes_gcm_encrypt(&aes_key, &iv, &compressed)?;
+            let mut keys = Vec::with_capacity(all.len());
+            for r in &all {
+                let enc = ml_kem_encapsulate(&r.ml_kem_public_key)?;
+                let mut wrapped = [0u8; AES_KEY_LEN];
+                for i in 0..AES_KEY_LEN {
+                    wrapped[i] = aes_key[i] ^ enc.shared_secret[i];
+                }
+                keys.push(MajikFileGroupKey {
+                    fingerprint: r.fingerprint.clone(),
+                    ml_kem_cipher_text: array_to_base64(&enc.cipher_text),
+                    encrypted_aes_key: array_to_base64(&wrapped),
+                });
             }
-        }
+            (
+                ct,
+                MjkbPayload::Group(MjkbGroupPayloadV2 {
+                    keys,
+                    n,
+                    m,
+                    z: compress,
+                    ca: compression_alg.clone(),
+                }),
+            )
+        };
 
-        let raw = &options.data;
-        if !options.bypass_size_limit && raw.len() > MAX_FILE_SIZE_BYTES {
-            return Err(MajikFileError::size_exceeded(
-                raw.len(),
-                MAX_FILE_SIZE_BYTES,
-            ));
-        }
+        let binary = encode_mjkb(&iv, &payload, &ciphertext)?;
+        Ok(EncryptCoreResult {
+            size_stored: binary.len(),
+            binary,
+            iv_hex,
+            file_hash,
+            size_original: raw.len(),
+            resolved_mime_type: resolved_mime,
+            participants,
+            is_group,
+            compression_alg,
+        })
+    }
 
-        // ── Infer MIME type from filename if not provided ──────────────────
-        let mime_type: Option<String> = options.mime_type.clone().or_else(|| {
+    // ── Create ─────────────────────────────────────────────────────────────
+
+    pub fn create(options: MajikFileCreateOptions) -> Result<MajikFile> {
+        MajikFileValidator::assert_user_id(Some(&options.user_id))?;
+
+        let mime_type = options.mime_type.clone().or_else(|| {
             options
                 .original_name
                 .as_deref()
                 .and_then(infer_mime_type_from_filename)
-                .map(|s| s.to_string())
         });
 
-        // ── Wrap in closure so we can catch and re-wrap errors ─────────────
-        let result: Result<MajikFile, MajikFileError> = (|| {
-            // ── 1. Hash (pre-compression, for dedup) ──────────────────────
-            let file_hash = sha256_hex(raw);
+        let core = Self::encrypt_core(
+            &EncryptCoreInput {
+                data: &options.data,
+                identity: &options.identity,
+                recipients: &options.recipients,
+                original_name: options.original_name.as_deref(),
+                mime_type: mime_type.as_deref(),
+                bypass_size_limit: options.bypass_size_limit,
+                compression_level: options.compression_level,
+                compressor: options.compressor.as_deref(),
+                pre_process_extra: None,
+            },
+            &DefaultHooks,
+        )?;
 
-            // ── 2. Compression ────────────────────────────────────────────
-            // Note: WebP conversion is a browser Canvas API feature and is
-            // intentionally omitted from the Rust port. Images pass through
-            // as raw bytes. The frontend JS can perform WebP re-encoding
-            // before calling the Tauri command if desired.
-            let resolved_mime_type = mime_type.clone();
-
-            let compressible = match options.context {
-                FileContext::UserUpload | FileContext::ThreadAttachment => true,
-                _ => should_compress(resolved_mime_type.as_deref()),
-            };
-
-            let compressed = if compressible {
-                MajikCompressor::compress(raw, options.compression_level)?
-            } else {
-                raw.clone()
-            };
-
-            // ── 3. IV ──────────────────────────────────────────────────────
-            let iv = generate_random_bytes(IV_LENGTH)?;
-            let iv_hex = hex::encode(&iv);
-
-            // ── 4. Encrypt ─────────────────────────────────────────────────
-            let cleaned_recipients =
-                deduplicate_recipients(options.recipients.clone(), &options.identity.fingerprint);
-            assert_recipient_limit(&cleaned_recipients)?;
-
-            // Owner is always the first key entry
-            let all_recipients: Vec<MajikFileRecipient> = std::iter::once(MajikFileRecipient {
-                fingerprint: options.identity.fingerprint.clone(),
-                public_key: options.identity.public_key.clone(),
-                ml_kem_public_key: options.identity.ml_kem_public_key.clone(),
-            })
-            .chain(cleaned_recipients.iter().cloned())
-            .collect();
-
-            let participant_pub_keys: Vec<MajikMessagePublicKey> = all_recipients
-                .iter()
-                .map(|r| r.public_key.clone())
-                .collect();
-
-            let is_group_file = !cleaned_recipients.is_empty();
-
-            let (ciphertext, payload) = if !is_group_file {
-                // ── Single ─────────────────────────────────────────────────
-                // ML-KEM encapsulate → sharedSecret used as AES-256-GCM key
-                let (shared_secret, ml_kem_ct) =
-                    ml_kem_encapsulate(&options.identity.ml_kem_public_key)?;
-                let ct = aes_gcm_encrypt(&shared_secret, &iv, &compressed)?;
-
-                let p = MjkbPayload::Single(MjkbSinglePayload {
-                    ml_kem_cipher_text: array_to_base64(&ml_kem_ct),
-                    n: options.original_name.clone(),
-                    m: resolved_mime_type.clone(),
-                    c: Some(options.context.as_str().to_string()),
-                });
-                (ct, p)
-            } else {
-                // ── Group ──────────────────────────────────────────────────
-                // Random group AES key encrypts the file once
-                let aes_key = generate_random_bytes(AES_KEY_LEN)?;
-                let ct = aes_gcm_encrypt(&aes_key, &iv, &compressed)?;
-
-                let mut keys = Vec::with_capacity(all_recipients.len());
-                for r in &all_recipients {
-                    let (shared_secret, ml_kem_ct) = ml_kem_encapsulate(&r.ml_kem_public_key)?;
-                    // One-time-pad: safe because sharedSecret is 32 uniformly random bytes
-                    let encrypted_aes_key: Vec<u8> = aes_key
-                        .iter()
-                        .zip(shared_secret.iter())
-                        .map(|(a, s)| a ^ s)
-                        .collect();
-                    keys.push(MajikFileGroupKey {
-                        fingerprint: r.fingerprint.clone(),
-                        ml_kem_cipher_text: array_to_base64(&ml_kem_ct),
-                        encrypted_aes_key: array_to_base64(&encrypted_aes_key),
-                    });
-                }
-
-                let p = MjkbPayload::Group(MjkbGroupPayload {
-                    keys,
-                    n: options.original_name.clone(),
-                    m: resolved_mime_type.clone(),
-                    c: Some(options.context.as_str().to_string()),
-                });
-                (ct, p)
-            };
-
-            // ── 5. Encode .mjkb ────────────────────────────────────────────
-            let mjkb_bytes = encode_mjkb(&iv, &payload, &ciphertext);
-
-            // ── 6. R2 key ──────────────────────────────────────────────────
-            let r2_key = match &options.context {
-                FileContext::ChatImage => build_chat_image_r2_key(
-                    options.conversation_id.as_deref().unwrap(),
-                    &options.user_id,
-                    &file_hash,
-                ),
-                _ if options.is_temporary => {
-                    build_temporary_r2_key(&options.user_id, &file_hash, options.expires_at)
-                }
-                _ => build_permanent_r2_key(&options.user_id, &file_hash),
-            };
-
-            let now = chrono::Utc::now().to_rfc3339();
-            let id = options.id.clone().unwrap_or_else(generate_uuid);
-
-            let json = MajikFileJson {
-                id,
-                user_id: options.user_id.clone(),
-                r2_key,
-                original_name: options.original_name.clone(),
-                mime_type: resolved_mime_type,
-                size_original: raw.len() as u64,
-                size_stored: mjkb_bytes.len() as u64,
-                file_hash,
-                encryption_iv: iv_hex,
-                storage_type: if options.is_temporary {
-                    StorageType::Temporary
-                } else {
-                    StorageType::Permanent
-                },
-                is_shared: options.is_shared,
-                share_token: None,
-                context: Some(options.context.clone()),
-                chat_message_id: options.chat_message_id.clone(),
-                thread_message_id: options.thread_message_id.clone(),
-                thread_id: options.thread_id.clone(),
-                conversation_id: options.conversation_id.clone(),
-                participants: participant_pub_keys,
-                expires_at: if options.is_temporary {
-                    Some(build_expiry_date(options.expires_at))
-                } else {
-                    None
-                },
-                timestamp: Some(now.clone()),
-                last_update: Some(now),
-            };
-
-            let instance = MajikFile::from_parts(json, Some(mjkb_bytes), is_group_file);
-            instance.validate_create()?;
-            Ok(instance)
-        })();
-
-        result.map_err(|e| {
-            if matches!(
-                e.code,
-                crate::core::error::MajikFileErrorCode::EncryptionFailed
-            ) {
-                e
-            } else {
-                e // pass through all typed errors as-is
-            }
-        })
+        let now = now_iso();
+        let json = MajikFileJson {
+            id: options.id.unwrap_or_else(generate_uuid),
+            schema_version: FILE_SCHEMA_VERSION,
+            kind: FILE_KIND.to_string(),
+            user_id: options.user_id,
+            original_name: options.original_name,
+            mime_type: core.resolved_mime_type,
+            size_original: core.size_original as u64,
+            size_stored: core.size_stored as u64,
+            file_hash: core.file_hash,
+            encryption_iv: core.iv_hex,
+            participants: core.participants,
+            kem_alg: CRYPTO_SUITE.kem_alg.to_string(),
+            cipher_alg: CRYPTO_SUITE.cipher_alg.to_string(),
+            compression_level: options.compression_level,
+            compression_alg: core.compression_alg,
+            timestamp: Some(now.clone()),
+            last_update: Some(now),
+            signature: None,
+        };
+        Self::from_parts(json, Some(core.binary), core.is_group)
     }
 
-    // ── Quick-create wrappers ────────────────────────────────────────────────
-
-    /// Create a chat image file.
-    /// Validates that the MIME type is image/* and size ≤ 25 MB.
-    pub fn create_chat_image(
-        data: Vec<u8>,
-        user_id: String,
-        identity: MajikFileIdentity,
-        conversation_id: String,
-        mime_type: String,
-        original_name: Option<String>,
-        recipients: Vec<MajikFileRecipient>,
-        chat_message_id: Option<String>,
-    ) -> Result<MajikFile, MajikFileError> {
-        if !mime_type.starts_with("image/") {
-            return Err(MajikFileError::invalid_input(format!(
-                "create_chat_image: mime_type must be an image/* type (got \"{mime_type}\")"
-            )));
-        }
-        const CHAT_IMAGE_MAX: usize = 25 * 1024 * 1024;
-        if data.len() > CHAT_IMAGE_MAX {
-            return Err(MajikFileError::size_exceeded(data.len(), CHAT_IMAGE_MAX));
-        }
-        MajikFile::create(CreateOptions {
-            data,
-            user_id,
-            identity,
-            context: FileContext::ChatImage,
-            conversation_id: Some(conversation_id),
-            mime_type: Some(mime_type),
-            original_name,
-            recipients,
-            chat_message_id,
-            is_temporary: false,
-            ..Default::default()
-        })
+    pub fn create_and_sign<P: SignatureProvider>(
+        options: MajikFileCreateOptions,
+        provider: &P,
+        key: &P::SigningKey,
+        sign_options: &SignOptions,
+    ) -> Result<MajikFile> {
+        let mut file = Self::create(options)?;
+        file.sign(provider, key, sign_options)?;
+        Ok(file)
     }
 
-    /// Create a chat attachment file.
-    pub fn create_chat_attachment(
-        data: Vec<u8>,
-        user_id: String,
-        identity: MajikFileIdentity,
-        chat_message_id: String,
-        original_name: Option<String>,
-        mime_type: Option<String>,
-        recipients: Vec<MajikFileRecipient>,
-    ) -> Result<MajikFile, MajikFileError> {
-        MajikFile::create(CreateOptions {
-            data,
-            user_id,
-            identity,
-            context: FileContext::ChatAttachment,
-            chat_message_id: Some(chat_message_id),
-            original_name,
-            mime_type,
-            recipients,
-            is_temporary: false,
-            ..Default::default()
-        })
+    // ── Decrypt ────────────────────────────────────────────────────────────
+
+    fn resolve_decompression_codec<'a>(
+        alg: &str,
+        options: &'a DecryptCompressionOptions,
+    ) -> Result<&'a dyn CompressionCodec> {
+        if alg == COMPRESSION_SUITE.alg {
+            return Ok(&ZSTD_CODEC);
+        }
+        options
+            .compressors
+            .iter()
+            .find(|c| c.alg() == alg)
+            .map(|c| c.as_ref())
+            .ok_or_else(|| MajikFileError::unsupported_compression_alg(alg))
     }
 
-    /// Create a thread attachment file.
-    pub fn create_thread_attachment(
-        data: Vec<u8>,
-        user_id: String,
-        identity: MajikFileIdentity,
-        thread_id: String,
-        thread_message_id: Option<String>,
-        original_name: Option<String>,
-        mime_type: Option<String>,
-        recipients: Vec<MajikFileRecipient>,
-    ) -> Result<MajikFile, MajikFileError> {
-        MajikFile::create(CreateOptions {
-            data,
-            user_id,
-            identity,
-            context: FileContext::ThreadAttachment,
-            thread_id: Some(thread_id),
-            thread_message_id,
-            original_name,
-            mime_type,
-            recipients,
-            is_temporary: false,
-            ..Default::default()
-        })
-    }
-
-    /// Create a permanent user upload.
-    pub fn create_user_upload(
-        data: Vec<u8>,
-        user_id: String,
-        identity: MajikFileIdentity,
-        original_name: Option<String>,
-        mime_type: Option<String>,
-        is_shared: bool,
-        recipients: Vec<MajikFileRecipient>,
-    ) -> Result<MajikFile, MajikFileError> {
-        MajikFile::create(CreateOptions {
-            data,
-            user_id,
-            identity,
-            context: FileContext::UserUpload,
-            original_name,
-            mime_type,
-            is_shared,
-            recipients,
-            is_temporary: false,
-            ..Default::default()
-        })
-    }
-
-    /// Create a temporary user upload with a typed TTL.
-    pub fn create_temporary_upload(
-        data: Vec<u8>,
-        user_id: String,
-        identity: MajikFileIdentity,
-        original_name: Option<String>,
-        mime_type: Option<String>,
-        duration: Option<TempFileDuration>,
-        recipients: Vec<MajikFileRecipient>,
-    ) -> Result<MajikFile, MajikFileError> {
-        let dur = duration.unwrap_or(TempFileDuration::Fifteen);
-        MajikFile::create(CreateOptions {
-            data,
-            user_id,
-            identity,
-            context: FileContext::UserUpload,
-            original_name,
-            mime_type,
-            recipients,
-            is_temporary: true,
-            expires_at: dur,
-            ..Default::default()
-        })
-    }
-
-    // ── PARTICIPANT ACCESS CHECKS ────────────────────────────────────────────
-
-    /// Returns true if the given public key is in the participants list.
-    /// O(n) scan — participants lists are small in practice.
-    pub fn has_participant_access(&self, public_key: &MajikMessagePublicKey) -> bool {
-        if public_key.trim().is_empty() {
-            return false;
-        }
-        self.participants.contains(public_key)
-    }
-
-    /// Bind this file to a thread mail after initial creation (once-only).
-    pub fn bind_to_thread_mail(
-        &mut self,
-        thread_id: String,
-        thread_message_id: String,
-    ) -> Result<(), MajikFileError> {
-        if !matches!(self.context, Some(FileContext::ThreadAttachment)) {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_thread_mail: only thread_attachment files can be bound to a mail",
-            ));
-        }
-        if self.thread_id.is_some() || self.thread_message_id.is_some() {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_thread_mail: this file is already bound to a thread mail",
-            ));
-        }
-        if thread_id.trim().is_empty() {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_thread_mail: thread_id is required",
-            ));
-        }
-        if thread_message_id.trim().is_empty() {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_thread_mail: thread_message_id is required",
-            ));
-        }
-        self.thread_id = Some(thread_id);
-        self.thread_message_id = Some(thread_message_id);
-        self.last_update = Some(chrono::Utc::now().to_rfc3339());
-        Ok(())
-    }
-
-    /// Bind this file to a chat conversation after initial creation (once-only).
-    pub fn bind_to_chat_conversation(
-        &mut self,
-        conversation_id: String,
-        chat_message_id: String,
-    ) -> Result<(), MajikFileError> {
-        if !matches!(self.context, Some(FileContext::ChatAttachment)) {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_chat_conversation: only chat_attachment files can be bound",
-            ));
-        }
-        if self.chat_message_id.is_some() || self.conversation_id.is_some() {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_chat_conversation: this file is already bound",
-            ));
-        }
-        if conversation_id.trim().is_empty() {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_chat_conversation: conversation_id is required",
-            ));
-        }
-        if chat_message_id.trim().is_empty() {
-            return Err(MajikFileError::invalid_input(
-                "bind_to_chat_conversation: chat_message_id is required",
-            ));
-        }
-        self.conversation_id = Some(conversation_id);
-        self.chat_message_id = Some(chat_message_id);
-        self.last_update = Some(chrono::Utc::now().to_rfc3339());
-        Ok(())
-    }
-
-    // ── DECRYPT ──────────────────────────────────────────────────────────────
-
-    /// Decrypt a .mjkb binary.
-    ///
-    /// Single: Decapsulate → sharedSecret → AES key → decompress → raw bytes.
-    /// Group:  Find key entry by fingerprint → decapsulate → XOR → AES key → decompress.
-    ///
-    /// ML-KEM decapsulation NEVER fails on a wrong key — AES-GCM auth catches it.
-    ///
-    /// Mirrors `MajikFile.decrypt()` in TypeScript.
-    pub fn decrypt(
+    /// Decode → recover AES key → authenticate+decrypt → decompress using `z`
+    /// (v2) or the mime fallback (v1). Keys and the compressed intermediate
+    /// are wiped on drop. ML-KEM never fails on a wrong key; AES-GCM auth does.
+    fn decrypt_core(
         source: &[u8],
-        fingerprint: &str,
-        ml_kem_secret_key: &[u8],
-    ) -> Result<Vec<u8>, MajikFileError> {
-        if ml_kem_secret_key.len() != ML_KEM_SK_LEN {
-            return Err(MajikFileError::invalid_input(format!(
-                "ml_kem_secret_key must be {ML_KEM_SK_LEN} bytes (got {})",
-                ml_kem_secret_key.len()
-            )));
-        }
+        identity: &MajikFileDecryptIdentity<'_>,
+        options: &DecryptCompressionOptions,
+    ) -> Result<(Vec<u8>, AnyMjkbPayload)> {
+        MajikFileValidator::assert_ml_kem_secret_key(
+            Some(identity.ml_kem_secret_key),
+            "identity.mlKemSecretKey",
+        )?;
 
-        let decoded = decode_mjkb(source).map_err(|e| {
-            MajikFileError::decryption_failed("File decryption failed", Some(Box::new(e)))
-        })?;
+        let raw = Self::strip_mjks_trailer(source);
+        let decoded = decode_mjkb(raw)?;
 
-        let aes_key = Self::recover_aes_key(&decoded.payload, fingerprint, ml_kem_secret_key)?;
-
+        let aes_key = resolve_aes_key_from_payload(
+            &decoded.payload,
+            identity.fingerprint,
+            identity.ml_kem_secret_key,
+        )?;
         let decrypted =
             aes_gcm_decrypt(&aes_key, &decoded.iv, &decoded.ciphertext)?.ok_or_else(|| {
                 MajikFileError::decryption_failed(
@@ -672,459 +590,383 @@ impl MajikFile {
                     None,
                 )
             })?;
+        drop(aes_key);
 
-        let compressible = match decoded.payload.context_str() {
-            Some("user_upload") | Some("thread_attachment") => true,
-            c => should_compress(c),
-        };
+        let payload = decoded.payload;
+        let should_decompress = payload
+            .z()
+            .unwrap_or_else(|| should_compress_mime(payload.m()));
 
-        if compressible {
-            MajikCompressor::decompress(&decrypted)
-        } else {
-            Ok(decrypted)
-        }
-    }
-
-    /// Decrypt and return bytes together with the original filename and MIME type
-    /// that were embedded in the payload at encryption time.
-    ///
-    /// Preferred for File Vault UI — avoids a second parse of the binary.
-    ///
-    /// Returns `(bytes, original_name, mime_type)`.
-    ///
-    /// Mirrors `MajikFile.decryptWithMetadata()` in TypeScript.
-    pub fn decrypt_with_metadata(
-        source: &[u8],
-        fingerprint: &str,
-        ml_kem_secret_key: &[u8],
-    ) -> Result<(Vec<u8>, Option<String>, Option<String>), MajikFileError> {
-        if ml_kem_secret_key.len() != ML_KEM_SK_LEN {
-            return Err(MajikFileError::invalid_input(format!(
-                "ml_kem_secret_key must be {ML_KEM_SK_LEN} bytes (got {})",
-                ml_kem_secret_key.len()
-            )));
-        }
-
-        let decoded = decode_mjkb(source).map_err(|e| {
-            MajikFileError::decryption_failed("File decryption failed", Some(Box::new(e)))
-        })?;
-
-        let aes_key = Self::recover_aes_key(&decoded.payload, fingerprint, ml_kem_secret_key)?;
-
-        let decrypted =
-            aes_gcm_decrypt(&aes_key, &decoded.iv, &decoded.ciphertext)?.ok_or_else(|| {
-                MajikFileError::decryption_failed(
-                    "Decryption failed — wrong key or corrupted .mjkb file",
-                    None,
-                )
-            })?;
-
-        let original_name = decoded.payload.original_name().map(|s| s.to_string());
-        let mime_type_str = decoded.payload.mime_type().map(|s| s.to_string());
-
-        let compressible = match decoded.payload.context_str() {
-            Some("user_upload") | Some("thread_attachment") => true,
-            c => should_compress(c),
-        };
-
-        let bytes = if compressible {
-            MajikCompressor::decompress(&decrypted)?
+        let bytes = if should_decompress {
+            let alg = payload.ca().unwrap_or(COMPRESSION_SUITE.alg);
+            let codec = Self::resolve_decompression_codec(alg, options)?;
+            let compressed = Zeroizing::new(decrypted);
+            codec.decompress(&compressed)? // `compressed` wiped when dropped
         } else {
             decrypted
         };
-
-        Ok((bytes, original_name, mime_type_str))
+        Ok((bytes, payload))
     }
 
-    /// Decrypt the .mjkb binary already loaded on this instance.
-    /// Mirrors `decryptBinary()` in TypeScript.
-    pub fn decrypt_binary(
+    pub fn decrypt<'a>(
+        source: &[u8],
+        identity: impl Into<MajikFileDecryptIdentity<'a>>,
+        options: Option<&DecryptCompressionOptions>,
+    ) -> Result<Vec<u8>> {
+        let default = DecryptCompressionOptions::default();
+        let (bytes, _) = Self::decrypt_core(source, &identity.into(), options.unwrap_or(&default))?;
+        Ok(bytes)
+    }
+
+    /// Does NOT verify the signature — pass it to a [`SignatureProvider`].
+    pub fn decrypt_with_metadata_from<'a>(
+        source: &[u8],
+        identity: impl Into<MajikFileDecryptIdentity<'a>>,
+        signature_raw: Option<&str>,
+        options: Option<&DecryptCompressionOptions>,
+    ) -> Result<DecryptedWithMetadata> {
+        let default = DecryptCompressionOptions::default();
+        let (bytes, payload) =
+            Self::decrypt_core(source, &identity.into(), options.unwrap_or(&default))?;
+        Ok(DecryptedWithMetadata {
+            bytes,
+            original_name: payload.n().map(str::to_string),
+            mime_type: payload.m().map(str::to_string),
+            signature: signature_raw
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+        })
+    }
+
+    pub fn decrypt_with_metadata<'a>(
         &self,
-        fingerprint: &str,
-        ml_kem_secret_key: &[u8],
-    ) -> Result<Vec<u8>, MajikFileError> {
-        let binary = self
+        identity: impl Into<MajikFileDecryptIdentity<'a>>,
+        options: Option<&DecryptCompressionOptions>,
+    ) -> Result<DecryptedWithMetadata> {
+        let bin = self
             .binary
-            .as_ref()
+            .as_deref()
             .ok_or_else(MajikFileError::missing_binary)?;
-        MajikFile::decrypt(binary, fingerprint, ml_kem_secret_key)
+        Self::decrypt_with_metadata_from(bin, identity, self.signature.as_deref(), options)
     }
 
-    /// Shared key-recovery logic for single and group payloads.
-    fn recover_aes_key(
-        payload: &MjkbPayload,
-        fingerprint: &str,
-        ml_kem_secret_key: &[u8],
-    ) -> Result<Vec<u8>, MajikFileError> {
-        match payload {
-            MjkbPayload::Single(p) => {
-                let ml_kem_ct = base64_to_bytes(&p.ml_kem_cipher_text)?;
-                ml_kem_decapsulate(&ml_kem_ct, ml_kem_secret_key)
-            }
-            MjkbPayload::Group(p) => {
-                if fingerprint.trim().is_empty() {
-                    return Err(MajikFileError::invalid_input(
-                        "fingerprint is required to decrypt group files",
-                    ));
-                }
-                let entry = p
-                    .keys
-                    .iter()
-                    .find(|k| k.fingerprint == fingerprint)
-                    .ok_or_else(|| {
-                        MajikFileError::decryption_failed(
-                            format!(
-                                "No key entry found for fingerprint \"{fingerprint}\" \
-                                 — this identity does not have access to this file"
-                            ),
-                            None,
-                        )
-                    })?;
-
-                let ml_kem_ct = base64_to_bytes(&entry.ml_kem_cipher_text)?;
-                let shared_secret = ml_kem_decapsulate(&ml_kem_ct, ml_kem_secret_key)?;
-                let enc_aes_key = base64_to_bytes(&entry.encrypted_aes_key)?;
-
-                // Recover group AES key: aesKey = encryptedAesKey XOR sharedSecret
-                let aes_key: Vec<u8> = enc_aes_key
-                    .iter()
-                    .zip(shared_secret.iter())
-                    .map(|(e, s)| e ^ s)
-                    .collect();
-                Ok(aes_key)
-            }
-        }
+    pub fn decrypt_binary<'a>(
+        &self,
+        identity: impl Into<MajikFileDecryptIdentity<'a>>,
+        options: Option<&DecryptCompressionOptions>,
+    ) -> Result<Vec<u8>> {
+        let bin = self
+            .binary
+            .as_deref()
+            .ok_or_else(MajikFileError::missing_binary)?;
+        Self::decrypt(bin, identity, options)
     }
 
-    // ── STORAGE TYPE MUTATION ────────────────────────────────────────────────
-
-    /// Mutate the storage type in-place and rebuild the R2 key.
-    /// Low-level escape hatch — prefer `set_permanent()` / `set_temporary()`.
-    pub fn set_storage_type(
+    /// Decrypt and cache plaintext on the instance (any old cache is wiped).
+    pub fn decrypt_hydrate<'a>(
         &mut self,
-        storage_type: StorageType,
-        expires_at: Option<String>,
-        duration: TempFileDuration,
-    ) -> Result<(), MajikFileError> {
-        if storage_type == StorageType::Temporary && expires_at.is_none() {
-            return Err(MajikFileError::invalid_input(
-                "set_storage_type: expires_at is required when switching to temporary",
-            ));
-        }
-        if matches!(self.context, Some(FileContext::ChatImage)) {
-            return Err(MajikFileError::invalid_input(
-                "set_storage_type: chat_image files are conversation-scoped \
-                 and cannot change storage type",
-            ));
-        }
+        identity: impl Into<MajikFileDecryptIdentity<'a>>,
+        options: Option<&DecryptCompressionOptions>,
+    ) -> Result<&mut Self> {
+        let bin = self
+            .binary
+            .as_deref()
+            .ok_or_else(MajikFileError::missing_binary)?;
+        let default = DecryptCompressionOptions::default();
+        let (bytes, _) = Self::decrypt_core(bin, &identity.into(), options.unwrap_or(&default))?;
+        self.decrypted = Some(Zeroizing::new(bytes)); // old value dropped → wiped
+        Ok(self)
+    }
 
-        let new_r2_key = match storage_type {
-            StorageType::Temporary => {
-                build_temporary_r2_key(&self.user_id, &self.file_hash, duration)
+    /// Participant check by public key (falling back to fingerprint, as TS).
+    pub fn can_decrypt(&self, identity: &MajikFileDecryptIdentity<'_>) -> bool {
+        if let Some(pk) = identity.public_key.filter(|p| !p.is_empty()) {
+            return self.participants.iter().any(|p| p == pk);
+        }
+        if !identity.fingerprint.is_empty() {
+            return self.participants.iter().any(|p| p == identity.fingerprint);
+        }
+        false
+    }
+
+    // ── Batch ──────────────────────────────────────────────────────────────
+
+    /// Hydrates each file in place; failures are collected, not fatal.
+    /// (Sequential — pure-Rust crypto is CPU-bound; wrap in rayon if desired.)
+    pub fn batch_decrypt<T: AsMut<MajikFile>>(
+        files: &mut [T],
+        identity: &MajikFileDecryptIdentity<'_>,
+        options: Option<&DecryptCompressionOptions>,
+    ) -> Result<BatchDecryptResult> {
+        MajikFileValidator::assert_ml_kem_secret_key(
+            Some(identity.ml_kem_secret_key),
+            "identity.mlKemSecretKey",
+        )?;
+        let mut decrypted = Vec::new();
+        let mut errors = Vec::new();
+        for item in files.iter_mut() {
+            let file = item.as_mut();
+            let id = file.id.clone();
+            if file.has_decrypted_file() {
+                decrypted.push(id);
+                continue;
             }
-            StorageType::Permanent => build_permanent_r2_key(&self.user_id, &self.file_hash),
-        };
-
-        self.expires_at = if storage_type == StorageType::Temporary {
-            expires_at
-        } else {
-            None
-        };
-        self.storage_type = storage_type;
-        self.r2_key = new_r2_key;
-        self.last_update = Some(chrono::Utc::now().to_rfc3339());
-        Ok(())
+            if !file.can_decrypt(identity) {
+                errors.push(BatchDecryptError {
+                    id,
+                    reason: format!(
+                        "Key \"{}\" is not a participant of this file.",
+                        identity.fingerprint
+                    ),
+                });
+                continue;
+            }
+            match file.decrypt_hydrate(*identity, options) {
+                Ok(_) => decrypted.push(id),
+                Err(e) => errors.push(BatchDecryptError {
+                    id,
+                    reason: e.message.clone(),
+                }),
+            }
+        }
+        Ok(BatchDecryptResult {
+            success: errors.is_empty(),
+            decrypted,
+            errors,
+        })
     }
 
-    /// Switch to permanent storage. Clears any expiry date and updates the R2 key.
-    pub fn set_permanent(&mut self) -> Result<(), MajikFileError> {
-        self.set_storage_type(StorageType::Permanent, None, TempFileDuration::Fifteen)
+    pub fn batch_lock<T: AsMut<MajikFile>>(files: &mut [T]) -> BatchLockResult {
+        let (mut locked, mut skipped) = (0, 0);
+        for item in files.iter_mut() {
+            let f = item.as_mut();
+            if !f.has_decrypted_file() {
+                skipped += 1;
+                continue;
+            }
+            f.secure_lock();
+            locked += 1;
+        }
+        BatchLockResult { locked, skipped }
     }
 
-    /// Switch to temporary storage with a typed TTL.
-    pub fn set_temporary(&mut self, duration: TempFileDuration) -> Result<(), MajikFileError> {
-        let expires = build_expiry_date(duration);
-        self.set_storage_type(StorageType::Temporary, Some(expires), duration)
+    /// Wipes and clears the decrypted cache.
+    pub fn secure_lock(&mut self) -> &mut Self {
+        self.decrypted = None; // Zeroizing wipes on drop
+        self
     }
 
-    // ── SERIALISATION ────────────────────────────────────────────────────────
+    // ── Serialisation ──────────────────────────────────────────────────────
 
-    /// Serialise metadata to a plain struct matching the Supabase table.
-    /// The encrypted binary is intentionally excluded.
-    /// Mirrors `toJSON()` in TypeScript.
-    pub fn to_json(&self) -> Result<MajikFileJson, MajikFileError> {
+    /// Metadata only — neither the binary nor the decrypted cache.
+    pub fn to_json(&self) -> Result<MajikFileJson> {
         self.validate()?;
         Ok(MajikFileJson {
             id: self.id.clone(),
+            schema_version: self.schema_version,
+            kind: self.kind.clone(),
             user_id: self.user_id.clone(),
-            r2_key: self.r2_key.clone(),
             original_name: self.original_name.clone(),
             mime_type: self.mime_type.clone(),
             size_original: self.size_original,
             size_stored: self.size_stored,
             file_hash: self.file_hash.clone(),
             encryption_iv: self.encryption_iv.clone(),
-            storage_type: self.storage_type.clone(),
-            is_shared: self.is_shared,
-            share_token: self.share_token.clone(),
-            context: self.context.clone(),
-            chat_message_id: self.chat_message_id.clone(),
-            thread_message_id: self.thread_message_id.clone(),
-            thread_id: self.thread_id.clone(),
             participants: self.participants.clone(),
-            conversation_id: self.conversation_id.clone(),
-            expires_at: self.expires_at.clone(),
+            kem_alg: self.kem_alg.clone(),
+            cipher_alg: self.cipher_alg.clone(),
+            compression_level: self.compression_level,
+            compression_alg: self.compression_alg.clone(),
             timestamp: self.timestamp.clone(),
             last_update: self.last_update.clone(),
+            signature: self.signature.clone(),
         })
     }
 
-    /// Restore a MajikFile from its serialised JSON representation.
-    /// The R2 prefix check is NOT performed here — rows restored from
-    /// Supabase may have been written by earlier code and should not fail.
-    ///
-    /// Mirrors `MajikFile.fromJSON()` in TypeScript.
-    pub fn from_json(
-        json: MajikFileJson,
-        binary: Option<Vec<u8>>,
-    ) -> Result<MajikFile, MajikFileError> {
-        let mut is_group = false;
-        if let Some(ref bin) = binary {
-            if let Ok(decoded) = decode_mjkb(bin) {
-                is_group = decoded.payload.is_group();
-            }
-        }
-        let instance = MajikFile::from_parts(json, binary, is_group);
-        instance.validate()?;
-        Ok(instance)
+    /// ⚠️ Includes plaintext (base64). Never persist.
+    pub fn to_dangerous_json(&self) -> Result<MajikFileDangerousJson> {
+        Ok(MajikFileDangerousJson {
+            json: self.to_json()?,
+            decrypted_base64: self.decrypted.as_ref().map(|d| array_to_base64(d)),
+        })
     }
 
-    // ── Binary export ────────────────────────────────────────────────────────
+    /// Peek at a binary's payload to detect group vs single mode.
+    pub fn detect_is_group_from_binary(binary: Option<&[u8]>) -> bool {
+        binary
+            .and_then(|b| decode_mjkb(b).ok())
+            .map(|d| d.payload.is_group())
+            .unwrap_or(false)
+    }
 
-    /// Export the encrypted binary as raw bytes.
-    /// Mirrors `toBinaryBytes()` in TypeScript.
-    pub fn to_binary_bytes(&self) -> Result<&[u8], MajikFileError> {
+    pub fn from_json(json: MajikFileJson, binary: Option<Vec<u8>>) -> Result<MajikFile> {
+        MajikFileValidator::assert_schema_version(json.schema_version, FILE_SCHEMA_VERSION)?;
+        let is_group = Self::detect_is_group_from_binary(binary.as_deref());
+        Self::from_parts(json, binary, is_group)
+    }
+
+    // ── .mjkb export ───────────────────────────────────────────────────────
+
+    pub fn to_mjkb(&self) -> Result<&[u8]> {
         self.binary
             .as_deref()
             .ok_or_else(MajikFileError::missing_binary)
     }
-
-    /// Export the encrypted binary as an owned `Vec<u8>`.
-    /// Mirrors `toMJKB()` in TypeScript.
-    pub fn to_mjkb(&self) -> Result<Vec<u8>, MajikFileError> {
-        Ok(self.to_binary_bytes()?.to_vec())
+    pub fn to_binary_bytes(&self) -> Result<&[u8]> {
+        self.to_mjkb()
     }
 
-    // ── VALIDATE ─────────────────────────────────────────────────────────────
+    // ── MJKS trailer: [.mjkb][sig JSON][u32 BE len]["MJKS"] ────────────────
 
-    /// Validate all required properties against business invariants.
-    /// Collects ALL errors before throwing — mirrors TypeScript behaviour.
-    ///
-    /// Mirrors `validate()` in TypeScript.
-    pub fn validate(&self) -> Result<(), MajikFileError> {
-        let mut errors: Vec<String> = Vec::new();
-
-        if self.id.trim().is_empty() {
-            errors.push("id is required".into());
-        }
-        if self.user_id.trim().is_empty() {
-            errors.push("user_id is required".into());
-        }
-        if self.r2_key.trim().is_empty() {
-            errors.push("r2_key is required".into());
-        }
-        if self.file_hash.trim().is_empty() {
-            errors.push("file_hash is required".into());
-        }
-        if self.encryption_iv.trim().is_empty() {
-            errors.push("encryption_iv is required".into());
-        }
-        if self.chat_message_id.is_some() && self.thread_message_id.is_some() {
-            errors.push("chat_message_id and thread_message_id cannot both be set".into());
-        }
-        if matches!(self.context, Some(FileContext::ChatImage))
-            && self
-                .conversation_id
-                .as_deref()
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-        {
-            errors.push("conversation_id is required for chat_image context".into());
-        }
-        if self.storage_type == StorageType::Temporary && self.expires_at.is_none() {
-            errors.push("expires_at is required for temporary files".into());
-        }
-
-        if !errors.is_empty() {
-            return Err(MajikFileError::validation_failed(errors));
-        }
-        Ok(())
+    pub fn has_mjks_trailer(data: &[u8]) -> bool {
+        data.len() >= MJKS_OVERHEAD + 23 && data[data.len() - MJKS_MAGIC_LEN..] == MJKS_MAGIC
     }
 
-    /// Stricter validation used only during create() — includes R2 prefix checks.
-    fn validate_create(&self) -> Result<(), MajikFileError> {
-        self.validate()?;
-
-        let mut errors: Vec<String> = Vec::new();
-        let permanent_prefix = format!("{}/{}/", R2Prefix::PERMANENT, self.user_id);
-        let temporary_prefix = format!("{}/", R2Prefix::TEMPORARY);
-        let chat_image_prefix = format!("{}/", R2Prefix::CHAT_IMAGE);
-
-        match &self.context {
-            Some(FileContext::ChatImage) => {
-                if !self.r2_key.starts_with(&chat_image_prefix) {
-                    errors.push(format!(
-                        "r2_key for chat_image files must start with \"{chat_image_prefix}\""
-                    ));
-                }
-            }
-            _ if self.storage_type == StorageType::Permanent => {
-                if !self.r2_key.starts_with(&permanent_prefix) {
-                    errors.push(format!(
-                        "r2_key for permanent files must start with \"{permanent_prefix}\""
-                    ));
-                }
-            }
-            _ if self.storage_type == StorageType::Temporary => {
-                if !self.r2_key.starts_with(&temporary_prefix) {
-                    errors.push(format!(
-                        "r2_key for temporary files must start with \"{temporary_prefix}\""
-                    ));
-                }
-            }
-            _ => {}
-        }
-
-        if !errors.is_empty() {
-            return Err(MajikFileError::validation_failed(errors));
-        }
-        Ok(())
+    fn mjks_sig_len(data: &[u8]) -> usize {
+        let o = data.len() - MJKS_OVERHEAD;
+        u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) as usize
     }
 
-    // ── OWNERSHIP ────────────────────────────────────────────────────────────
+    /// Raw signature JSON from the trailer, if present and parseable.
+    pub fn extract_mjks_signature_json(data: &[u8]) -> Option<serde_json::Value> {
+        if !Self::has_mjks_trailer(data) {
+            return None;
+        }
+        let sig_len = Self::mjks_sig_len(data);
+        if sig_len == 0 || sig_len > data.len() - MJKS_OVERHEAD || sig_len > i32::MAX as usize {
+            return None;
+        }
+        let start = data.len() - MJKS_OVERHEAD - sig_len;
+        serde_json::from_slice(&data[start..start + sig_len]).ok()
+    }
 
-    /// Returns true if the given user_id matches the file's owner.
+    /// Serialized signature from the trailer, via the provider.
+    pub fn extract_mjks_signature<P: SignatureProvider>(
+        data: &[u8],
+        provider: &P,
+    ) -> Option<String> {
+        let json = Self::extract_mjks_signature_json(data)?;
+        provider.from_json(&json).ok()
+    }
+
+    pub fn strip_mjks_trailer(data: &[u8]) -> &[u8] {
+        if !Self::has_mjks_trailer(data) {
+            return data;
+        }
+        let sig_len = Self::mjks_sig_len(data);
+        match data.len().checked_sub(MJKS_OVERHEAD + sig_len) {
+            Some(end) => &data[..end],
+            None => data,
+        }
+    }
+
+    /// .mjkb bytes + attached signature as an MJKS trailer (offline-verifiable).
+    pub fn to_signed_mjkb<P: SignatureProvider>(&self, provider: &P) -> Result<Vec<u8>> {
+        let binary = self
+            .binary
+            .as_deref()
+            .ok_or_else(MajikFileError::missing_binary)?;
+        let sig = self
+            .signature
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                MajikFileError::invalid_input(
+                    "toSignedMJKB: no signature attached — call sign() or createAndSign() first",
+                )
+            })?;
+        let sig_bytes = serde_json::to_vec(&provider.to_json(sig)?)
+            .map_err(|e| MajikFileError::invalid_input(format!("toSignedMJKB: {e}")))?;
+
+        let mut out = Vec::with_capacity(binary.len() + sig_bytes.len() + MJKS_OVERHEAD);
+        out.extend_from_slice(binary);
+        out.extend_from_slice(&sig_bytes);
+        out.extend_from_slice(&(sig_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&MJKS_MAGIC);
+        Ok(out)
+    }
+
+    /// One-call verification of a signed .mjkb (verifies the *ciphertext*).
+    pub fn verify_signed_mjkb<P: SignatureProvider>(
+        source: &[u8],
+        provider: &P,
+        verifier: &P::Verifier,
+    ) -> Result<P::Verification> {
+        if !Self::has_mjks_trailer(source) {
+            return Err(MajikFileError::invalid_input(
+                "verifySignedMJKB: no MJKS trailer found — use toSignedMJKB() to export a signed file",
+            ));
+        }
+        let sig = Self::extract_mjks_signature(source, provider).ok_or_else(|| {
+            MajikFileError::invalid_input(
+                "verifySignedMJKB: MJKS trailer present but signature could not be parsed",
+            )
+        })?;
+        provider.verify(Self::strip_mjks_trailer(source), &sig, verifier)
+    }
+
+    // ── Validate ───────────────────────────────────────────────────────────
+
+    /// Every base-level error, without throwing — public so wrappers can
+    /// extend it and fail once.
+    pub fn collect_errors(&self) -> Vec<String> {
+        [
+            MajikFileValidator::check_id(Some(&self.id)),
+            MajikFileValidator::check_user_id(Some(&self.user_id)),
+            MajikFileValidator::check_file_hash(Some(&self.file_hash)),
+            MajikFileValidator::check_encryption_iv(Some(&self.encryption_iv)),
+            MajikFileValidator::check_non_negative_size(self.size_original as f64, "size_original"),
+            MajikFileValidator::check_non_negative_size(self.size_stored as f64, "size_stored"),
+            MajikFileValidator::check_schema_version(self.schema_version, FILE_SCHEMA_VERSION),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        MajikFileValidator::assert_all(&self.collect_errors())
+    }
+
+    // ── Ownership / participants ───────────────────────────────────────────
+
     pub fn user_is_owner(&self, user_id: &str) -> bool {
         !user_id.trim().is_empty() && self.user_id == user_id
     }
 
-    // ── BINARY MANAGEMENT ────────────────────────────────────────────────────
-
-    /// Attach (or replace) the encrypted .mjkb binary on this instance.
     pub fn attach_binary(&mut self, binary: Vec<u8>) {
         self.binary = Some(binary);
     }
-
-    /// Clear the in-memory binary to free memory after an upload completes.
     pub fn clear_binary(&mut self) {
         self.binary = None;
     }
 
-    // ── SHARING ──────────────────────────────────────────────────────────────
-
-    /// Returns true if this file has an active share token.
-    pub fn has_share_token(&self) -> bool {
-        self.share_token
-            .as_ref()
-            .map(|t| !t.is_empty())
-            .unwrap_or(false)
+    pub fn has_participant_access(&self, public_key: &str) -> bool {
+        !public_key.trim().is_empty() && self.participants.iter().any(|p| p == public_key)
     }
 
-    /// Toggle sharing state.
-    /// - Not shared → sets is_shared = true, assigns token (auto-generated if None).
-    /// - Shared      → sets is_shared = false, clears token.
-    /// Returns the active share token, or None if sharing was disabled.
-    ///
-    /// Mirrors `toggleSharing()` in TypeScript.
-    pub fn toggle_sharing(
-        &mut self,
-        token: Option<String>,
-    ) -> Result<Option<String>, MajikFileError> {
-        if self.is_shared {
-            self.is_shared = false;
-            self.share_token = None;
-            self.last_update = Some(chrono::Utc::now().to_rfc3339());
-            Ok(None)
-        } else {
-            if let Some(ref t) = token {
-                if t.trim().is_empty() {
-                    return Err(MajikFileError::invalid_input(
-                        "toggle_sharing: token must be a non-empty string when provided",
-                    ));
-                }
-            }
-            let t = token.unwrap_or_else(generate_uuid);
-            self.is_shared = true;
-            self.share_token = Some(t.clone());
-            self.last_update = Some(chrono::Utc::now().to_rfc3339());
-            Ok(Some(t))
-        }
-    }
-
-    // ── EXPIRY ────────────────────────────────────────────────────────────────
-
-    /// Returns true if this file has passed its expiry date.
-    pub fn is_expired(&self) -> bool {
-        is_expired(self.expires_at.as_deref())
-    }
-
-    /// Returns true if this file uses temporary storage.
-    pub fn is_temporary(&self) -> bool {
-        self.storage_type == StorageType::Temporary
-    }
-
-    // ── MIME / FORMAT HELPERS ─────────────────────────────────────────────────
-
-    /// Returns true if the MIME type can be rendered inline in a browser.
-    pub fn is_inline_viewable(&self) -> bool {
-        is_mime_type_inline_viewable(self.mime_type.as_deref())
-    }
-
-    /// Safe download filename derived from the hash + original extension.
-    pub fn safe_filename(&self) -> String {
-        derive_filename(&self.file_hash, self.original_name.as_deref())
-    }
-
-    // ── SIZE CHECK ────────────────────────────────────────────────────────────
-
-    /// Returns true if the original file size exceeds the given limit in MB.
-    pub fn exceeds_size(&self, limit_mb: f64) -> Result<bool, MajikFileError> {
-        if limit_mb <= 0.0 || !limit_mb.is_finite() {
-            return Err(MajikFileError::invalid_input(format!(
-                "exceeds_size: limit_mb must be a positive finite number (got {limit_mb})"
-            )));
-        }
-        Ok(self.size_original > (limit_mb * 1024.0 * 1024.0) as u64)
-    }
-
-    // ── ACCESS CHECK ─────────────────────────────────────────────────────────
-
-    /// Lightweight fingerprint check.
-    /// Returns true if sha256_base64(public_key) == owner_fingerprint.
-    /// Does NOT attempt decryption.
-    ///
-    /// Mirrors `MajikFile.hasPublicKeyAccess()` in TypeScript.
-    pub fn has_public_key_access(
-        public_key: &[u8],
-        owner_fingerprint: &str,
-    ) -> Result<bool, MajikFileError> {
-        if public_key.len() != ML_KEM_PK_LEN {
-            return Err(MajikFileError::invalid_input(format!(
-                "has_public_key_access: public_key must be {ML_KEM_PK_LEN} bytes (got {})",
-                public_key.len()
-            )));
-        }
+    /// True if SHA-256 (base64) of the public key equals `owner_fingerprint`.
+    pub fn has_public_key_access(public_key: &[u8], owner_fingerprint: &str) -> Result<bool> {
+        MajikFileValidator::assert_ml_kem_public_key(Some(public_key), "publicKey")?;
         if owner_fingerprint.trim().is_empty() {
             return Err(MajikFileError::invalid_input(
-                "has_public_key_access: owner_fingerprint is required",
+                "hasPublicKeyAccess: ownerFingerprint is required",
             ));
         }
         Ok(sha256_base64(public_key) == owner_fingerprint)
     }
 
-    // ── STATS ─────────────────────────────────────────────────────────────────
+    // ── Size / stats / dupes ───────────────────────────────────────────────
 
-    /// Return a human-readable stats snapshot for display in a file manager UI.
+    pub fn exceeds_size(&self, limit_mb: f64) -> Result<bool> {
+        if !limit_mb.is_finite() || limit_mb <= 0.0 {
+            return Err(MajikFileError::invalid_input(format!(
+                "exceedsSize: limitMB must be a positive finite number (got {limit_mb})"
+            )));
+        }
+        Ok(self.size_original as f64 > limit_mb * 1024.0 * 1024.0)
+    }
+
     pub fn get_stats(&self) -> MajikFileStats {
         MajikFileStats {
             id: self.id.clone(),
@@ -1133,85 +975,224 @@ impl MajikFile {
             size_original_human: format_bytes(self.size_original),
             size_stored_human: format_bytes(self.size_stored),
             compression_ratio_pct: MajikCompressor::compression_ratio_pct(
-                self.size_original,
-                self.size_stored,
+                self.size_original as f64,
+                self.size_stored as f64,
             ),
             file_hash: self.file_hash.clone(),
-            storage_type: self.storage_type.clone(),
             is_group: self.is_group,
-            context: self.context.clone(),
-            is_shared: self.is_shared,
-            is_expired: self.is_expired(),
-            expires_at: self.expires_at.clone(),
-            timestamp: self.timestamp.clone(),
-            r2_key: self.r2_key.clone(),
+            is_signed: self.is_signed(),
         }
     }
 
-    // ── DUPLICATE DETECTION ───────────────────────────────────────────────────
-
-    /// Returns true if this file has the same plaintext content as another
-    /// (comparison by SHA-256 file_hash of original bytes).
     pub fn is_duplicate_of(&self, other: &MajikFile) -> bool {
         self.file_hash == other.file_hash
     }
-
-    /// Returns true if raw bytes would produce a duplicate.
-    /// Use this to short-circuit the encrypt + upload flow.
-    pub fn would_be_duplicate(raw_bytes: &[u8], existing_hash: &str) -> bool {
-        sha256_hex(raw_bytes) == existing_hash
+    pub fn would_be_duplicate(raw: &[u8], existing_hash: &str) -> bool {
+        sha256_hex(raw) == existing_hash
     }
 
-    // ── STATIC HELPERS ────────────────────────────────────────────────────────
+    // ── Static helpers ─────────────────────────────────────────────────────
 
-    /// Quick magic-byte check. Does NOT fully parse.
     pub fn is_mjkb_candidate(data: &[u8]) -> bool {
         data.len() >= 5 && data[..4] == MJKB_MAGIC
     }
-
-    /// Full structural validation of a .mjkb binary (without decrypting).
-    /// Mirrors `MajikFile.isValidMJKB()` in TypeScript.
-    pub fn is_valid_mjkb(data: &[u8]) -> bool {
-        let Ok(decoded) = decode_mjkb(data) else {
-            return false;
-        };
-        match &decoded.payload {
-            MjkbPayload::Single(p) => !p.ml_kem_cipher_text.is_empty(),
-            MjkbPayload::Group(p) => !p.keys.is_empty(),
-        }
-    }
-
-    /// Build a default ISO-8601 expiry date for temporary files.
-    pub fn build_expiry_date(days: TempFileDuration) -> String {
-        build_expiry_date(days)
-    }
-
-    /// Format bytes as a human-readable string (e.g. "4.2 MB").
     pub fn format_bytes(bytes: u64) -> String {
         format_bytes(bytes)
     }
-
-    /// Infer a MIME type from a filename extension.
-    pub fn infer_mime_type(filename: &str) -> Option<&'static str> {
+    pub fn infer_mime_type(filename: &str) -> Option<String> {
         infer_mime_type_from_filename(filename)
     }
-
-    /// Return the raw byte length of a slice.
     pub fn get_raw_file_size(data: &[u8]) -> usize {
         data.len()
     }
-}
 
-impl std::fmt::Display for MajikFile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "MajikFile {{ id: {}, hash: {}…, size: {}, type: {}, storage: {} }}",
-            self.id,
-            &self.file_hash[..8.min(self.file_hash.len())],
-            format_bytes(self.size_original),
-            if self.is_group { "group" } else { "single" },
-            self.storage_type,
-        )
+    /// Structural validation beyond the magic-byte check. Does NOT decrypt.
+    pub fn is_valid_mjkb(data: &[u8]) -> bool {
+        if data.len() < 23 || data[..4] != MJKB_MAGIC {
+            return false;
+        }
+        let o = 17; // 4 magic + 1 version + 12 IV
+        let payload_len = u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        if payload_len == 0 || payload_len > i32::MAX as u32 {
+            return false;
+        }
+        let start = o + 4;
+        let Some(ct_start) = start.checked_add(payload_len as usize) else {
+            return false;
+        };
+        if ct_start >= data.len() {
+            return false;
+        }
+        let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&data[start..ct_start])
+        else {
+            return false;
+        };
+        let Some(obj) = payload.as_object() else {
+            return false;
+        };
+        let is_single = obj.contains_key("mlKemCipherText") && !obj.contains_key("keys");
+        let is_group = obj
+            .get("keys")
+            .and_then(|k| k.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        is_single || is_group
+    }
+
+    // ── Signing ────────────────────────────────────────────────────────────
+
+    pub fn attach_signature<P: SignatureProvider>(
+        &mut self,
+        provider: &P,
+        serialized: &str,
+    ) -> Result<()> {
+        if serialized.trim().is_empty() {
+            return Err(MajikFileError::invalid_input(
+                "attachSignature: signature string must be non-empty",
+            ));
+        }
+        provider.validate(serialized).map_err(|e| {
+            MajikFileError::invalid_input(format!(
+                "attachSignature: signature string is not a valid serialized MajikSignature — {}",
+                e.message
+            ))
+        })?;
+        self.signature = Some(serialized.to_string());
+        self.last_update = Some(now_iso());
+        Ok(())
+    }
+
+    pub fn remove_signature(&mut self) {
+        if self.signature.is_none() {
+            return;
+        }
+        self.signature = None;
+        self.last_update = Some(now_iso());
+    }
+
+    /// Sign the loaded .mjkb binary (covers ciphertext — verifying never
+    /// needs decryption). Replaces any existing signature.
+    pub fn sign<P: SignatureProvider>(
+        &mut self,
+        provider: &P,
+        key: &P::SigningKey,
+        options: &SignOptions,
+    ) -> Result<String> {
+        let binary = self
+            .binary
+            .as_deref()
+            .ok_or_else(MajikFileError::missing_binary)?;
+        let opts = SignOptions {
+            content_type: options
+                .content_type
+                .clone()
+                .or_else(|| self.mime_type.clone()),
+            timestamp: options.timestamp.clone(),
+        };
+        let sig = provider.sign(binary, key, &opts)?;
+        self.attach_signature(provider, &sig)?;
+        Ok(sig)
+    }
+
+    /// `Ok(None)` if unsigned, binary not loaded, or the stored signature is corrupt.
+    pub fn verify<P: SignatureProvider>(
+        &self,
+        provider: &P,
+        verifier: &P::Verifier,
+    ) -> Result<Option<P::Verification>> {
+        let (Some(sig), Some(bin)) = (
+            self.signature.as_deref().filter(|s| !s.trim().is_empty()),
+            self.binary.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        if provider.validate(sig).is_err() {
+            return Ok(None);
+        }
+        provider.verify(bin, sig, verifier).map(Some)
+    }
+
+    /// Decrypt (correctness gate) then verify the attached signature.
+    pub fn verify_binary<'a, P: SignatureProvider>(
+        &self,
+        identity: impl Into<MajikFileDecryptIdentity<'a>>,
+        provider: &P,
+        verifier: &P::Verifier,
+        options: Option<&DecryptCompressionOptions>,
+    ) -> Result<P::Verification> {
+        let bin = self
+            .binary
+            .as_deref()
+            .ok_or_else(MajikFileError::missing_binary)?;
+        let sig = self
+            .signature
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                MajikFileError::invalid_input("verifyBinary: this file has no attached signature")
+            })?;
+        provider.validate(sig).map_err(|e| {
+            MajikFileError::invalid_input(format!(
+                "verifyBinary: stored signature is corrupt — {}",
+                e.message
+            ))
+        })?;
+        Self::decrypt(bin, identity, options)?;
+        provider.verify(bin, sig, verifier)
+    }
+
+    /// Envelope metadata for UI, without cryptographic verification.
+    pub fn get_signature_info<P: SignatureProvider>(&self, provider: &P) -> Option<FileSignature> {
+        let sig = self.signature.as_deref().filter(|s| !s.trim().is_empty())?;
+        provider.info(sig).ok()
+    }
+
+    // ── canDecryptMJKB ─────────────────────────────────────────────────────
+
+    /// Can this identity decrypt a raw .mjkb without instantiating a MajikFile?
+    /// Group files: fingerprint fast-path unless `options.strict`. Single
+    /// files (or strict): needs `ml_kem_secret_key` for a trial decrypt.
+    pub fn can_decrypt_mjkb(
+        source: &[u8],
+        fingerprint: &str,
+        ml_kem_secret_key: Option<&[u8]>,
+        options: &CanDecryptMjkbOptions,
+    ) -> bool {
+        let raw = Self::strip_mjks_trailer(source);
+        let Ok(decoded) = decode_mjkb(raw) else {
+            return false;
+        };
+
+        if decoded.payload.is_group() {
+            if !Self::group_has_fingerprint(&decoded.payload, fingerprint) {
+                return false;
+            }
+            if !options.strict {
+                return true;
+            }
+        }
+
+        match ml_kem_secret_key {
+            Some(sk) => Self::decrypt_core(
+                raw,
+                &MajikFileDecryptIdentity::new(fingerprint, sk),
+                &options.compression,
+            )
+            .is_ok(),
+            None => false,
+        }
+    }
+
+    fn group_has_fingerprint(payload: &AnyMjkbPayload, fingerprint: &str) -> bool {
+        use crate::core::types::{MjkbPayloadV1, MjkbPayloadV2};
+        match payload {
+            AnyMjkbPayload::V2(MjkbPayloadV2::Group(p)) => {
+                p.keys.iter().any(|k| k.fingerprint == fingerprint)
+            }
+            AnyMjkbPayload::V1(MjkbPayloadV1::Group(p)) => {
+                p.keys.iter().any(|k| k.fingerprint == fingerprint)
+            }
+            _ => false,
+        }
     }
 }

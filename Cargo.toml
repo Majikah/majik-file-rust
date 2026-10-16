@@ -1,74 +1,48 @@
 [package]
 name = "majik-file"
-version = "0.0.1"
+version = "1.0.0"
 edition = "2021"
 description = "Majik File is the core cryptographic engine for secure file handling in the Majikah ecosystem. It provides a post-quantum secure MJKB format designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms."
 license = "Apache-2.0"
 authors = ["Zelijah"]
 repository = "https://github.com/Majikah/majik-file-rust"
-readme = "README.md"   # points to your local README
-keywords = [
-    "post-quantum",
-    "ml-kem",
-    "aes-gcm",
-    "file-encryption",
-    "zstd",
-]
+readme = "README.md"
+keywords = ["post-quantum", "ml-kem", "aes-gcm", "file-encryption", "zstd"]
+categories = ["cryptography", "compression"]
 
 [lib]
 name = "majik_file"
 path = "src/lib.rs"
 
+[features]
+default = []
+tauri = ["dep:tauri"]
+
 [dependencies]
-# AES-256-GCM — RustCrypto (matches @stablelib/aes + @stablelib/gcm)
-aes-gcm = { version = "0.10", features = ["aes"] }
-
-# ML-KEM-768 FIPS-203 — matches @noble/post-quantum ml_kem768
-# Uses the 2400-byte expanded decapsulation key format, same as noble
-ml-kem     = { version = "0.2.1", features = [] }
-rand_core  = "0.6"          # must match what ml-kem 0.2.x uses
-getrandom  = "0.2"          # for OsRng on all targets
-
-
-# SHA-256 — matches @stablelib/sha256
+# AES-256-GCM (RustCrypto) — replaces @stablelib/aes + @stablelib/gcm
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+# ML-KEM-768 — replaces @noble/post-quantum. 0.2.x is REQUIRED: it uses the
+# 2400-byte expanded secret key that noble uses (0.3.0-rc uses a 64-byte seed).
+ml-kem = { version = "0.2.1", features = ["zeroize"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# SHA-256 — replaces @stablelib/sha256
 sha2 = "0.10"
-digest = "0.11.2"
-
-# Zstd compression — matches @bokuweb/zstd-wasm
-zstd = { version = "0.13", default-features = false }
-
-
-# Serialisation (JSON payloads inside .mjkb)
+# Pure-Rust zstd (all 22 levels) — replaces @bokuweb/zstd-wasm
+structured-zstd = { version = "0.2.1", default-features = false, features = ["std", "hash"] }
+# Best-effort memory wiping (only where it actually matters)
+zeroize = { version = "1", features = ["derive"] }
+# JSON payloads / records
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# Base64 — matches arrayToBase64 / base64ToUint8Array
 base64 = "0.22"
-
-# UUID — matches crypto.randomUUID()
-uuid = { version = "1", features = ["v4", "fast-rng"] }
-
-# Timestamps
-chrono = { version = "0.4", features = ["serde"] }
-
-# Error handling
-thiserror = "2.0.18"
-
-# Hex encoding — for SHA-256 hex and IV hex
 hex = "0.4"
-
-# MIME type inference
-mime_guess = "2"
-anyhow = "1.0.102"
-rand = "0.10.0"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+thiserror = "2"
+# Optional Tauri v2 command macros and command integration.
+tauri = { version = "2", default-features = false, optional = true }
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-
-[features]
-tauri = []

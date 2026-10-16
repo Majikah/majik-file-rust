@@ -45,15 +45,11 @@
 
 use serde::{Deserialize, Serialize};
 
-// This module is optional and intended for Tauri desktop apps only.
-// Enable with `--features tauri` when building the library.
-#[cfg(feature = "tauri")]
-use serde as _serde_guard; // compile-time marker when feature enabled
-
-use crate::core::crypto::generate_ml_kem_keypair;
+use crate::core::crypto::crypto_provider::generate_ml_kem_keypair;
 use crate::core::types::{
     CreateOptions, FileContext, MajikFileIdentity, MajikFileRecipient, TempFileDuration,
 };
+use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::utils::{format_bytes, infer_mime_type_from_filename, sha256_base64, sha256_hex};
 use crate::majik_file::MajikFile;
 
@@ -61,6 +57,7 @@ use crate::majik_file::MajikFile;
 
 /// Passed from TypeScript → Rust for identity fields.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdentityPayload {
     pub public_key: String,
     pub fingerprint: String,
@@ -78,13 +75,14 @@ impl From<IdentityPayload> for MajikFileIdentity {
             public_key: p.public_key,
             fingerprint: p.fingerprint,
             ml_kem_public_key: p.ml_kem_public_key,
-            ml_kem_secret_key: p.ml_kem_secret_key,
+            ml_kem_secret_key: Zeroizing::new(p.ml_kem_secret_key),
         }
     }
 }
 
 /// Passed from TypeScript → Rust for a single recipient.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecipientPayload {
     pub fingerprint: String,
     pub public_key: String,
@@ -103,6 +101,7 @@ impl From<RecipientPayload> for MajikFileRecipient {
 
 /// Result returned to TypeScript after a successful `cmd_generate_ml_kem_keypair`.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KeypairResult {
     /// ML-KEM-768 public key (1184 bytes).
     pub public_key: Vec<u8>,
@@ -112,6 +111,7 @@ pub struct KeypairResult {
 
 /// Compact file metadata returned to TypeScript after encryption.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EncryptResult {
     /// Encrypted .mjkb binary bytes — upload this to R2.
     pub mjkb_bytes: Vec<u8>,
@@ -121,6 +121,7 @@ pub struct EncryptResult {
 
 /// DTO used by the Tauri invoke call for encryption to avoid many positional parameters.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EncryptRequest {
     pub data: Vec<u8>,
     pub user_id: String,
@@ -154,6 +155,7 @@ pub struct EncryptRequest {
 
 /// Result returned to TypeScript after a successful `cmd_decrypt_file_with_metadata`.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecryptWithMetadataResult {
     pub bytes: Vec<u8>,
     pub original_name: Option<String>,
@@ -166,10 +168,10 @@ pub struct DecryptWithMetadataResult {
 /// Intended for testing — production identities derive from a BIP-39 seed.
 #[tauri::command]
 pub fn cmd_generate_ml_kem_keypair() -> KeypairResult {
-    let (public_key, secret_key) = generate_ml_kem_keypair();
+    let keypair = generate_ml_kem_keypair();
     KeypairResult {
-        public_key,
-        secret_key,
+        public_key: keypair.public_key,
+        secret_key: keypair.secret_key.to_vec(),
     }
 }
 

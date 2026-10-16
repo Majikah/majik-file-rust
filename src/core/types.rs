@@ -1,305 +1,391 @@
+//! types.rs — TS interfaces/types become structs/enums/traits.
+//! Nothing here knows about chat, threads, R2 or other Majikah-specific
+//! concepts (that belongs to MajikMessageFile).
+
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
-/// String alias for a Majik Message public key (base64-encoded string).
-pub type MajikMessagePublicKey = String;
+use crate::core::compressor::majik_compressor::CompressionLevel;
+use crate::core::crypto::constants::{COMPRESSION_SUITE, CRYPTO_SUITE};
+use crate::core::crypto::zeroize::Zeroizing;
+use crate::core::error::Result;
 
-// ─── Domain enums ─────────────────────────────────────────────────────────────
+/// Base64 address of a Majik public key (`MajikKeyAddress`).
+pub type MajikKeyAddress = String;
+/// Base64 SHA-256 of the ML-KEM public key (`MajikKeyFingerprint`).
+pub type MajikKeyFingerprint = String;
 
-/// File usage context — mirrors `FileContext` in TypeScript.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileContext {
-    UserUpload,
-    ChatAttachment,
-    /// Rasterised WebP image sent in a chat conversation.
-    ChatImage,
-    ThreadAttachment,
+// ─── Compression codec (pluggable) ──────────────────────────────────────────
+
+/// Pluggable compression. `alg` is stamped into payload `ca` / JSON
+/// `compression_alg` and is the key used to find the codec again on decrypt.
+pub trait CompressionCodec: Send + Sync {
+    fn alg(&self) -> &str;
+    fn compress(&self, bytes: &[u8], level: Option<i32>) -> Result<Vec<u8>>;
+    fn decompress(&self, bytes: &[u8]) -> Result<Vec<u8>>;
 }
 
-impl FileContext {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::UserUpload => "user_upload",
-            Self::ChatAttachment => "chat_attachment",
-            Self::ChatImage => "chat_image",
-            Self::ThreadAttachment => "thread_attachment",
-        }
-    }
+/// Accepted by every decrypt-family method. Built-in zstd is always tried
+/// first and needs no entry; `compressors` is only consulted for other `ca`s.
+#[derive(Default, Clone)]
+pub struct DecryptCompressionOptions {
+    pub compressors: Vec<Arc<dyn CompressionCodec>>,
 }
 
-impl std::fmt::Display for FileContext {
+impl std::fmt::Debug for DecryptCompressionOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.debug_struct("DecryptCompressionOptions")
+            .field("compressor_count", &self.compressors.len())
+            .finish()
     }
 }
 
-/// Storage lifecycle — mirrors `StorageType` in TypeScript.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageType {
-    Permanent,
-    Temporary,
+// ─── Signature provider (replaces @majikah/majik-signature) ─────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct SignOptions {
+    pub content_type: Option<String>,
+    pub timestamp: Option<String>,
 }
 
-impl std::fmt::Display for StorageType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Permanent => write!(f, "permanent"),
-            Self::Temporary => write!(f, "temporary"),
-        }
-    }
+/// Envelope metadata of a signature (no cryptographic verification).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSignature {
+    pub signer_id: String,
+    pub timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub content_hash: String,
 }
 
-/// Allowed TTLs for temporary files in days — mirrors `TempFileDuration` in TypeScript.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TempFileDuration {
-    One = 1,
-    Two = 2,
-    Three = 3,
-    Five = 5,
-    Seven = 7,
-    Fifteen = 15,
+/// Abstraction over the signing library. MajikFile only stores the
+/// *serialized* signature string (base64) and delegates everything
+/// signature-specific to the provider.
+pub trait SignatureProvider {
+    /// Signing key (e.g. an unlocked MajikKey).
+    type SigningKey;
+    /// What verification needs (a key, or the signer's public keys).
+    type Verifier;
+    /// Verification outcome (e.g. `VerificationResult`).
+    type Verification;
+
+    /// Sign `data`, returning the serialized signature.
+    fn sign(&self, data: &[u8], key: &Self::SigningKey, options: &SignOptions) -> Result<String>;
+    fn verify(
+        &self,
+        data: &[u8],
+        serialized: &str,
+        verifier: &Self::Verifier,
+    ) -> Result<Self::Verification>;
+    /// Err if `serialized` is not a valid serialized signature.
+    fn validate(&self, serialized: &str) -> Result<()>;
+    fn info(&self, serialized: &str) -> Result<FileSignature>;
+    /// Signature → JSON value (embedded in the MJKS trailer).
+    fn to_json(&self, serialized: &str) -> Result<serde_json::Value>;
+    /// JSON value (from the MJKS trailer) → serialized signature.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_json(&self, json: &serde_json::Value) -> Result<String>;
 }
 
-impl TempFileDuration {
-    pub fn days(self) -> i64 {
-        self as i64
-    }
-}
+// ─── Identities & recipients ────────────────────────────────────────────────
 
-impl Default for TempFileDuration {
-    fn default() -> Self {
-        Self::Fifteen
-    }
-}
-
-// ─── Identities & Recipients ──────────────────────────────────────────────────
-
-/// The file owner's full identity — carries both keys.
-/// Mirrors `MajikFileIdentity` in TypeScript.
-#[derive(Debug, Clone)]
+/// File owner's full identity. The secret key is wiped on drop.
+#[derive(Clone)]
 pub struct MajikFileIdentity {
-    /// Base64-encoded message public key string.
-    pub public_key: MajikMessagePublicKey,
-    /// Base64 SHA-256 of the ML-KEM public key.
-    pub fingerprint: String,
+    pub public_key: MajikKeyAddress,
+    pub fingerprint: MajikKeyFingerprint,
     /// ML-KEM-768 public key (1184 bytes).
     pub ml_kem_public_key: Vec<u8>,
     /// ML-KEM-768 secret key (2400 bytes).
-    pub ml_kem_secret_key: Vec<u8>,
+    pub ml_kem_secret_key: Zeroizing<Vec<u8>>,
 }
 
-/// A recipient who can decrypt the file.
-/// Mirrors `MajikFileRecipient` in TypeScript.
+impl std::fmt::Debug for MajikFileIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MajikFileIdentity")
+            .field("public_key", &self.public_key)
+            .field("fingerprint", &self.fingerprint)
+            .field("ml_kem_secret_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MajikFileRecipient {
-    /// Base64 SHA-256 of the ML-KEM public key.
-    pub fingerprint: String,
-    pub public_key: MajikMessagePublicKey,
-    /// ML-KEM-768 public key (1184 bytes).
+    pub fingerprint: MajikKeyFingerprint,
+    pub public_key: MajikKeyAddress,
     pub ml_kem_public_key: Vec<u8>,
 }
 
-// ─── Per-recipient key entry (group .mjkb) ────────────────────────────────────
+/// Borrowed decrypt identity (`MajikFileDecryptIdentity`): no secret copy is
+/// made and the caller keeps ownership of — and responsibility for wiping —
+/// the secret key.
+#[derive(Clone, Copy)]
+pub struct MajikFileDecryptIdentity<'a> {
+    pub fingerprint: &'a str,
+    pub ml_kem_secret_key: &'a [u8],
+    /// Optional; used by `can_decrypt()` participant checks.
+    pub public_key: Option<&'a str>,
+}
 
-/// Per-recipient encrypted key entry stored inside a group .mjkb binary.
-/// Mirrors `MajikFileGroupKey` in TypeScript.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl<'a> MajikFileDecryptIdentity<'a> {
+    pub fn new(fingerprint: &'a str, ml_kem_secret_key: &'a [u8]) -> Self {
+        Self {
+            fingerprint,
+            ml_kem_secret_key,
+            public_key: None,
+        }
+    }
+    pub fn with_public_key(mut self, public_key: &'a str) -> Self {
+        self.public_key = Some(public_key);
+        self
+    }
+}
+
+impl<'a> From<&'a MajikFileIdentity> for MajikFileDecryptIdentity<'a> {
+    fn from(i: &'a MajikFileIdentity) -> Self {
+        Self {
+            fingerprint: &i.fingerprint,
+            ml_kem_secret_key: &i.ml_kem_secret_key,
+            public_key: Some(&i.public_key),
+        }
+    }
+}
+
+// ─── Per-recipient key entry (group .mjkb) ──────────────────────────────────
+
+/// `encrypted_aes_key = group_aes_key XOR ml_kem_shared_secret` (32 bytes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct MajikFileGroupKey {
-    /// Base64 SHA-256 fingerprint.
-    pub fingerprint: String,
-    /// Base64-encoded ML-KEM-768 ciphertext (1088 bytes).
-    #[serde(rename = "mlKemCipherText")]
+    pub fingerprint: MajikKeyFingerprint,
+    /// Base64 ML-KEM-768 ciphertext (1088 bytes).
     pub ml_kem_cipher_text: String,
-    /// Base64-encoded 32-byte encrypted AES key (groupAesKey XOR sharedSecret).
-    #[serde(rename = "encryptedAesKey")]
+    /// Base64 32-byte wrapped AES key.
     pub encrypted_aes_key: String,
 }
 
-// ─── .mjkb Payload Types ─────────────────────────────────────────────────────
+// ─── .mjkb payloads ─────────────────────────────────────────────────────────
 
-/// JSON payload for a single-recipient .mjkb binary.
-/// Mirrors `MjkbSinglePayload` in TypeScript.
+/// v1 (legacy, read-only): `c` embedded a FileContext; decompression was inferred.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MjkbSinglePayload {
-    /// Base64-encoded ML-KEM-768 ciphertext (1088 bytes).
-    #[serde(rename = "mlKemCipherText")]
+#[serde(rename_all = "camelCase")]
+pub struct MjkbSinglePayloadV1 {
     pub ml_kem_cipher_text: String,
-    /// Original filename — short key `n` keeps the binary compact.
+    #[serde(default)]
     pub n: Option<String>,
-    /// Original MIME type — short key `m` keeps the binary compact.
+    #[serde(default)]
     pub m: Option<String>,
-    /// Usage context — short key `c`.
+    #[serde(default)]
     pub c: Option<String>,
 }
 
-/// JSON payload for a group .mjkb binary.
-/// Mirrors `MjkbGroupPayload` in TypeScript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MjkbGroupPayload {
-    /// Per-recipient key entries.
+pub struct MjkbGroupPayloadV1 {
     pub keys: Vec<MajikFileGroupKey>,
-    /// Original filename.
+    #[serde(default)]
     pub n: Option<String>,
-    /// Original MIME type.
+    #[serde(default)]
     pub m: Option<String>,
-    /// Usage context.
+    #[serde(default)]
     pub c: Option<String>,
 }
 
-/// Discriminated union of the two payload types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum MjkbPayload {
-    Group(MjkbGroupPayload),
-    Single(MjkbSinglePayload),
+pub enum MjkbPayloadV1 {
+    Group(MjkbGroupPayloadV1),
+    Single(MjkbSinglePayloadV1),
 }
 
-impl MjkbPayload {
+/// v2 (current). Field order matters: it matches TS `JSON.stringify` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MjkbSinglePayloadV2 {
+    pub ml_kem_cipher_text: String,
+    pub n: Option<String>,
+    pub m: Option<String>,
+    /// True if the plaintext was compressed before encryption.
+    pub z: bool,
+    /// Compression algorithm; absent means "zstd". Only meaningful when `z`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MjkbGroupPayloadV2 {
+    pub keys: Vec<MajikFileGroupKey>,
+    pub n: Option<String>,
+    pub m: Option<String>,
+    pub z: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MjkbPayloadV2 {
+    Group(MjkbGroupPayloadV2),
+    Single(MjkbSinglePayloadV2),
+}
+
+/// "Current" payload — what `encode_mjkb()` always writes.
+pub type MjkbPayload = MjkbPayloadV2;
+
+/// Any payload `decode_mjkb()` may return (V2 is tried first: it requires `z`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AnyMjkbPayload {
+    V2(MjkbPayloadV2),
+    V1(MjkbPayloadV1),
+}
+
+impl AnyMjkbPayload {
     pub fn is_group(&self) -> bool {
-        matches!(self, Self::Group(_))
+        matches!(
+            self,
+            Self::V2(MjkbPayloadV2::Group(_)) | Self::V1(MjkbPayloadV1::Group(_))
+        )
     }
-
     pub fn is_single(&self) -> bool {
-        matches!(self, Self::Single(_))
+        !self.is_group()
     }
-
-    pub fn original_name(&self) -> Option<&str> {
+    /// Original filename (`n`).
+    pub fn n(&self) -> Option<&str> {
         match self {
-            Self::Single(p) => p.n.as_deref(),
-            Self::Group(p) => p.n.as_deref(),
+            Self::V2(MjkbPayloadV2::Group(p)) => p.n.as_deref(),
+            Self::V2(MjkbPayloadV2::Single(p)) => p.n.as_deref(),
+            Self::V1(MjkbPayloadV1::Group(p)) => p.n.as_deref(),
+            Self::V1(MjkbPayloadV1::Single(p)) => p.n.as_deref(),
         }
     }
-
-    pub fn mime_type(&self) -> Option<&str> {
+    /// MIME type (`m`).
+    pub fn m(&self) -> Option<&str> {
         match self {
-            Self::Single(p) => p.m.as_deref(),
-            Self::Group(p) => p.m.as_deref(),
+            Self::V2(MjkbPayloadV2::Group(p)) => p.m.as_deref(),
+            Self::V2(MjkbPayloadV2::Single(p)) => p.m.as_deref(),
+            Self::V1(MjkbPayloadV1::Group(p)) => p.m.as_deref(),
+            Self::V1(MjkbPayloadV1::Single(p)) => p.m.as_deref(),
         }
     }
-
-    pub fn context_str(&self) -> Option<&str> {
+    /// Explicit compression flag; `None` for v1 payloads.
+    pub fn z(&self) -> Option<bool> {
         match self {
-            Self::Single(p) => p.c.as_deref(),
-            Self::Group(p) => p.c.as_deref(),
+            Self::V2(MjkbPayloadV2::Group(p)) => Some(p.z),
+            Self::V2(MjkbPayloadV2::Single(p)) => Some(p.z),
+            Self::V1(_) => None,
+        }
+    }
+    /// Compression algorithm tag; `None` means zstd.
+    pub fn ca(&self) -> Option<&str> {
+        match self {
+            Self::V2(MjkbPayloadV2::Group(p)) => p.ca.as_deref(),
+            Self::V2(MjkbPayloadV2::Single(p)) => p.ca.as_deref(),
+            Self::V1(_) => None,
         }
     }
 }
 
-// ─── MajikFileJSON ────────────────────────────────────────────────────────────
+/// Fully parsed .mjkb binary.
+#[derive(Debug, Clone)]
+pub struct DecodedMjkb {
+    pub version: u8,
+    /// Authoritative IV from the binary header.
+    pub iv: Vec<u8>,
+    /// AES-GCM ciphertext (+16-byte tag).
+    pub ciphertext: Vec<u8>,
+    pub payload: AnyMjkbPayload,
+}
 
-/// Serialised representation of a MajikFile — maps to the Supabase table.
-/// Mirrors `MajikFileJSON` in TypeScript.
+// ─── Record schema ──────────────────────────────────────────────────────────
+
+/// `kind` stamped on base records (subclasses use their own literal).
+pub const FILE_KIND: &str = "file";
+
+/// Serialised MajikFile. The encrypted binary is intentionally excluded.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MajikFileJson {
     pub id: String,
+    /// Absent on legacy rows → deserializes to 0 (`LEGACY_SCHEMA_VERSION`).
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub kind: String,
     pub user_id: String,
-    pub r2_key: String,
     pub original_name: Option<String>,
     pub mime_type: Option<String>,
     pub size_original: u64,
     pub size_stored: u64,
+    /// SHA-256 hex of the original bytes (dedup key).
     pub file_hash: String,
-    /// Hex-encoded 12-byte AES-GCM IV.
+    /// Hex 12-byte IV (audit only; the binary header is authoritative).
     pub encryption_iv: String,
-    pub storage_type: StorageType,
-    pub is_shared: bool,
-    pub share_token: Option<String>,
-    pub context: Option<FileContext>,
-    pub chat_message_id: Option<String>,
-    pub thread_message_id: Option<String>,
-    pub thread_id: Option<String>,
-    pub participants: Vec<MajikMessagePublicKey>,
-    pub conversation_id: Option<String>,
-    pub expires_at: Option<String>,
+    pub participants: Vec<MajikKeyAddress>,
+    pub kem_alg: String,
+    pub cipher_alg: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_level: Option<CompressionLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression_alg: Option<String>,
     pub timestamp: Option<String>,
     pub last_update: Option<String>,
+    /// base64 serialized signature.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
-// ─── CreateOptions ────────────────────────────────────────────────────────────
+pub const DEFAULT_KEM_ALG: &str = CRYPTO_SUITE.kem_alg;
+pub const DEFAULT_CIPHER_ALG: &str = CRYPTO_SUITE.cipher_alg;
+pub const DEFAULT_COMPRESSION_ALG: &str = COMPRESSION_SUITE.alg;
 
-/// Options for `MajikFile::create()`.
-/// Mirrors `CreateOptions` in TypeScript.
-pub struct CreateOptions {
-    /// Raw binary content of the file to encrypt.
+/// `toDangerousJSON()` shape — includes plaintext. Never persist.
+#[derive(Debug, Clone, Serialize)]
+pub struct MajikFileDangerousJson {
+    #[serde(flatten)]
+    pub json: MajikFileJson,
+    pub decrypted_base64: Option<String>,
+}
+
+// ─── CreateOptions ──────────────────────────────────────────────────────────
+
+pub struct MajikFileCreateOptions {
     pub data: Vec<u8>,
-    /// UUID from auth.users — used for R2 key construction.
     pub user_id: String,
-    /// Identity of the file owner.
     pub identity: MajikFileIdentity,
-    /// Additional recipients beyond the owner (empty = single-recipient).
+    /// Additional recipients; non-empty → group .mjkb.
     pub recipients: Vec<MajikFileRecipient>,
-    /// File context.
-    pub context: FileContext,
-    /// Original filename.
     pub original_name: Option<String>,
-    /// MIME type string.
     pub mime_type: Option<String>,
-    /// If true, stored under files/public/ and auto-deleted after TTL.
-    pub is_temporary: bool,
-    /// If true, a share_token can be generated.
-    pub is_shared: bool,
-    /// Pre-computed UUID for the record. None = auto-generate.
     pub id: Option<String>,
-    /// Bypass the MAX_FILE_SIZE_BYTES (100 MB) limit.
     pub bypass_size_limit: bool,
-    /// Temporary file duration. Required when is_temporary = true.
-    pub expires_at: TempFileDuration,
-    pub chat_message_id: Option<String>,
-    pub thread_message_id: Option<String>,
-    pub thread_id: Option<String>,
-    /// Required when context is ChatImage.
-    pub conversation_id: Option<String>,
-    /// Zstd compression level 1–22. None = adaptive default (22, clamped).
-    pub compression_level: Option<i32>,
+    pub compression_level: Option<CompressionLevel>,
+    /// Custom codec replacing built-in zstd for this encryption.
+    pub compressor: Option<Arc<dyn CompressionCodec>>,
 }
 
-impl Default for CreateOptions {
-    fn default() -> Self {
+impl MajikFileCreateOptions {
+    pub fn new(data: Vec<u8>, user_id: impl Into<String>, identity: MajikFileIdentity) -> Self {
         Self {
-            data: Vec::new(),
-            user_id: String::new(),
-            identity: MajikFileIdentity {
-                public_key: String::new(),
-                fingerprint: String::new(),
-                ml_kem_public_key: Vec::new(),
-                ml_kem_secret_key: Vec::new(),
-            },
+            data,
+            user_id: user_id.into(),
+            identity,
             recipients: Vec::new(),
-            context: FileContext::UserUpload,
             original_name: None,
             mime_type: None,
-            is_temporary: false,
-            is_shared: false,
             id: None,
             bypass_size_limit: false,
-            expires_at: TempFileDuration::Fifteen,
-            chat_message_id: None,
-            thread_message_id: None,
-            thread_id: None,
-            conversation_id: None,
             compression_level: None,
+            compressor: None,
         }
     }
 }
 
-// ─── Decoded .mjkb Binary ─────────────────────────────────────────────────────
+// ─── Stats ──────────────────────────────────────────────────────────────────
 
-/// Internal representation of a fully parsed .mjkb binary.
-pub struct DecodedMjkb {
-    pub version: u8,
-    /// IV extracted from the binary header.
-    pub iv: Vec<u8>,
-    /// AES-GCM ciphertext.
-    pub ciphertext: Vec<u8>,
-    /// Parsed payload.
-    pub payload: MjkbPayload,
-}
-
-// ─── File Stats ───────────────────────────────────────────────────────────────
-
-/// Human-readable stats — mirrors `MajikFileStats` in TypeScript.
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MajikFileStats {
     pub id: String,
     pub original_name: Option<String>,
@@ -308,12 +394,6 @@ pub struct MajikFileStats {
     pub size_stored_human: String,
     pub compression_ratio_pct: f64,
     pub file_hash: String,
-    pub storage_type: StorageType,
     pub is_group: bool,
-    pub context: Option<FileContext>,
-    pub is_shared: bool,
-    pub is_expired: bool,
-    pub expires_at: Option<String>,
-    pub timestamp: Option<String>,
-    pub r2_key: String,
+    pub is_signed: bool,
 }

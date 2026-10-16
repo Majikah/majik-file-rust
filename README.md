@@ -1,7 +1,11 @@
 # majik-file
 
-[![Developed by Zelijah](https://img.shields.io/badge/Developed%20by-Zelijah-red?logo=github&logoColor=white)](https://thezelijah.world) ![GitHub Sponsors](https://img.shields.io/github/sponsors/jedlsf?style=plastic&label=Sponsors&link=https%3A%2F%2Fgithub.com%2Fsponsors%2Fjedlsf)
+[![Developed by Zelijah](https://img.shields.io/badge/Developed%20by-Zelijah-red?logo=github&logoColor=white&style=for-the-badge)](https://thezelijah.world) ![GitHub Sponsors](https://img.shields.io/github/sponsors/jedlsf?style=for-the-badge&label=Sponsors&link=https%3A%2F%2Fgithub.com%2Fsponsors%2Fjedlsf)
 
+[![Crates.io](https://img.shields.io/crates/v/majik-file.svg?logo=rust&color=D34516)](https://crates.io/crates/majik-file) [![Documentation](https://docs.rs/majik-file/badge.svg)](https://docs.rs/majik-file) ![crates downloads](https://img.shields.io/crates/d/majik-file?logo=rust&color=D34516) [![License](https://img.shields.io/badge/License-Apache_2.0-D34516.svg)](https://opensource.org/licenses/Apache-2.0) ![Rust](https://img.shields.io/badge/Rust-Ready-D34516) 
+
+
+[![Static Badge](https://img.shields.io/badge/IANA-vnd.majikah.bundle-green?style=for-the-badge)](https://www.iana.org/assignments/media-types/application/vnd.majikah.bundle) 
 
 
 Post-quantum file encryption for the Majik Message platform. Produces self-contained `.mjkb` binary files — sealed with **ML-KEM-768 + AES-256-GCM**, optionally Zstd-compressed, readable without any network access.
@@ -10,7 +14,7 @@ This is the **Rust port** of the [`@majikah/majik-file`](https://www.npmjs.com/p
 
 Designed for use in **Tauri desktop applications** and other native Rust environments where the TypeScript library cannot run.
 
-[![Crates.io](https://img.shields.io/crates/v/majik-file)](https://crates.io/crates/majik-file) ![Crates.io Downloads (latest version)](https://img.shields.io/crates/dv/majik-file) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) ![Rust](https://img.shields.io/badge/Rust-1.75+-orange)
+
 
 ---
 
@@ -62,6 +66,7 @@ Designed for use in **Tauri desktop applications** and other native Rust environ
   - [Contributing](#contributing)
   - [License](#license)
   - [Author](#author)
+  - [Contact](#contact)
 
 ---
 
@@ -311,60 +316,43 @@ let majik_file = MajikFile::create(CreateOptions {
 
 ## Tauri integration
 
-Register the Tauri commands in your `src-tauri/src/main.rs`:
+The crate includes optional Tauri v2 commands. Enable the `tauri` feature in
+`src-tauri/Cargo.toml` alongside your app's Tauri dependency:
+
+```toml
+[dependencies]
+majik-file = { version = "1", features = ["tauri"] }
+tauri = "2"
+```
+
+Register the crate's commands in `src-tauri/src/main.rs`:
 
 ```rust
-use majik_file::{MajikFile, CreateOptions, FileContext, MajikFileIdentity};
-
-#[tauri::command]
-fn encrypt_file(
-    data: Vec<u8>,
-    user_id: String,
-    fingerprint: String,
-    public_key: String,
-    ml_kem_public_key: Vec<u8>,
-    ml_kem_secret_key: Vec<u8>,
-    original_name: Option<String>,
-    mime_type: Option<String>,
-) -> Result<(Vec<u8>, serde_json::Value), String> {
-    let identity = MajikFileIdentity {
-        public_key,
-        fingerprint,
-        ml_kem_public_key,
-        ml_kem_secret_key,
-    };
-
-    let file = MajikFile::create(CreateOptions {
-        data,
-        user_id,
-        identity,
-        context: FileContext::UserUpload,
-        original_name,
-        mime_type,
-        ..Default::default()
-    })
-    .map_err(|e| e.to_string())?;
-
-    let mjkb = file.to_mjkb().map_err(|e| e.to_string())?;
-    let meta = file.to_json().map_err(|e| e.to_string())?;
-    let meta_json = serde_json::to_value(&meta).map_err(|e| e.to_string())?;
-
-    Ok((mjkb, meta_json))
-}
-
-#[tauri::command]
-fn decrypt_file(
-    mjkb_bytes: Vec<u8>,
-    fingerprint: String,
-    ml_kem_secret_key: Vec<u8>,
-) -> Result<(Vec<u8>, Option<String>, Option<String>), String> {
-    MajikFile::decrypt_with_metadata(&mjkb_bytes, &fingerprint, &ml_kem_secret_key)
-        .map_err(|e| e.to_string())
-}
+use majik_file::tauri_commands::{
+    cmd_decrypt_file,
+    cmd_decrypt_file_with_metadata,
+    cmd_encrypt_file,
+    cmd_format_bytes,
+    cmd_generate_ml_kem_keypair,
+    cmd_infer_mime_type,
+    cmd_is_valid_mjkb,
+    cmd_sha256_base64,
+    cmd_sha256_hex,
+};
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![encrypt_file, decrypt_file])
+        .invoke_handler(tauri::generate_handler![
+            cmd_generate_ml_kem_keypair,
+            cmd_encrypt_file,
+            cmd_decrypt_file,
+            cmd_decrypt_file_with_metadata,
+            cmd_is_valid_mjkb,
+            cmd_sha256_hex,
+            cmd_sha256_base64,
+            cmd_format_bytes,
+            cmd_infer_mime_type,
+        ])
         .run(tauri::generate_context!())
         .unwrap();
 }
@@ -375,28 +363,42 @@ fn main() {
 ```typescript
 import { invoke } from '@tauri-apps/api/core';
 
-// Encrypt
-const [mjkbBytes, metadata] = await invoke<[number[], object]>('encrypt_file', {
-  data: Array.from(fileBytes),
-  userId: currentUser.id,
-  fingerprint: identity.fingerprint,
-  publicKey: identity.publicKey,
-  mlKemPublicKey: Array.from(identity.mlKemPublicKey),
-  mlKemSecretKey: Array.from(identity.mlKemSecretKey),
-  originalName: file.name,
-  mimeType: file.type,
+// Encrypt. Request/response object fields use camelCase.
+const { mjkbBytes, metadata } = await invoke<{
+  mjkbBytes: number[];
+  metadata: object;
+}>('cmd_encrypt_file', {
+  req: {
+    data: Array.from(fileBytes),
+    userId: currentUser.id,
+    identity: {
+      publicKey: identity.publicKey,
+      fingerprint: identity.fingerprint,
+      mlKemPublicKey: Array.from(identity.mlKemPublicKey),
+      mlKemSecretKey: Array.from(identity.mlKemSecretKey),
+    },
+    context: 'user_upload',
+    originalName: file.name,
+    mimeType: file.type,
+  },
 });
 
-// Decrypt
-const [bytes, originalName, mimeType] = await invoke<[number[], string | null, string | null]>(
-  'decrypt_file',
-  {
-    mjkbBytes: Array.from(await fetchFromR2(r2Key)),
-    fingerprint: identity.fingerprint,
-    mlKemSecretKey: Array.from(identity.mlKemSecretKey),
-  }
-);
+// Decrypt and retrieve the embedded filename and MIME type.
+const decrypted = await invoke<{
+  bytes: number[];
+  originalName: string | null;
+  mimeType: string | null;
+}>('cmd_decrypt_file_with_metadata', {
+  mjkbBytes: Array.from(await fetchFromR2(r2Key)),
+  fingerprint: identity.fingerprint,
+  mlKemSecretKey: Array.from(identity.mlKemSecretKey),
+});
 ```
+
+The keypair command returns the secret key to the frontend as a byte array and
+is intended for testing; use your application's established identity/key
+management flow for production secrets. The `tauri` feature is opt-in, so the
+core crate has no Tauri dependency unless enabled.
 
 > **Note on WebP conversion:** The TypeScript library converts chat images to WebP using the browser's Canvas API before encryption. This Rust library does not perform image conversion — it operates on raw bytes only. If you need WebP normalisation for `chat_image` / `chat_attachment` contexts, perform the conversion on the frontend before calling the Tauri command.
 
@@ -736,15 +738,22 @@ If you want to contribute or help extend support to more platforms, reach out vi
 
 ## License
 
-[Apache-2.0](LICENSE) — free for personal and commercial use.
+**License:** [Apache-2.0](LICENSE) — free for personal and commercial use under the terms of the license.
 
 ---
 
 ## Author
 
-Made with 💙 by [@thezelijah](https://github.com/jedlsf)
+Developed by **Josef Elijah Fabian (Zelijah)** | [Majikah Solutions OPC](https://majikah.solutions/about)
 
 **Developer:** Josef Elijah Fabian  
 **GitHub:** [https://github.com/jedlsf](https://github.com/jedlsf)  
 **Business Email:** [business@thezelijah.world](mailto:business@thezelijah.world)  
 **Website:** [https://www.thezelijah.world](https://www.thezelijah.world)
+
+
+## Contact
+
+- **Business Email:** [business@majikah.solutions](mailto:business@majikah.solutions)
+- **Official Website:** [https://www.thezelijah.world](https://www.thezelijah.world)
+- **Majikah Ecosystem:** [https://majikah.solutions](https://majikah.solutions)
