@@ -1,6 +1,6 @@
 [package]
 name = "majik-file"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Majik File is the core cryptographic engine for secure file handling in the Majikah ecosystem. It provides a post-quantum secure MJKB format designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms."
 license = "Apache-2.0"
@@ -20,21 +20,22 @@ tauri = ["dep:tauri"]
 
 [dependencies]
 # AES-256-GCM (RustCrypto) — replaces @stablelib/aes + @stablelib/gcm
-aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes-gcm = { version = "0.11.1", features = ["zeroize"] }
+
 # ML-KEM-768 — replaces @noble/post-quantum. 0.2.x is REQUIRED: it uses the
 # 2400-byte expanded secret key that noble uses (0.3.0-rc uses a 64-byte seed).
-ml-kem = { version = "0.2.1", features = ["zeroize"] }
+ml-kem = { version = "0.3.2", features = ["getrandom"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # SHA-256 — replaces @stablelib/sha256
 sha2 = "0.10"
 # Pure-Rust zstd (all 22 levels) — replaces @bokuweb/zstd-wasm
 structured-zstd = { version = "0.2.1", default-features = false, features = ["std", "hash"] }
 # Best-effort memory wiping (only where it actually matters)
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1.9.1", features = ["zeroize_derive"] }
 # JSON payloads / records
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+base64 = "0.23.1"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

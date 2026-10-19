@@ -7,9 +7,12 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Key, Nonce,
 };
+#[allow(deprecated)]
+use ml_kem::ExpandedKeyEncoding;
+use ml_kem::Key as MlKemKey;
 use ml_kem::{
-    kem::{Decapsulate, Encapsulate},
-    Ciphertext, EncodedSizeUser, KemCore, MlKem768,
+    kem::{Decapsulate, Encapsulate, Kem, KeyExport},
+    Ciphertext, DecapsulationKey, EncapsulationKey, MlKem768,
 };
 use rand_core::{OsRng, RngCore};
 
@@ -19,8 +22,8 @@ use crate::core::crypto::constants::{
 use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::error::{MajikFileError, Result};
 
-type Ek768 = <MlKem768 as KemCore>::EncapsulationKey;
-type Dk768 = <MlKem768 as KemCore>::DecapsulationKey;
+type Ek768 = EncapsulationKey<MlKem768>;
+type Dk768 = DecapsulationKey<MlKem768>;
 type Ct768 = Ciphertext<MlKem768>;
 
 /// Result of an ML-KEM encapsulation. Named fields (not a tuple) so the
@@ -70,19 +73,21 @@ fn check_key_iv(fn_name: &str, key: &[u8], iv: &[u8]) -> Result<()> {
 /// Output: ciphertext || 16-byte GCM tag (same as stablelib `seal`).
 pub fn aes_gcm_encrypt(key: &[u8], iv: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     check_key_iv("aes_gcm_encrypt", key, iv)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    cipher
-        .encrypt(Nonce::from_slice(iv), plaintext)
-        .map_err(|e| {
-            MajikFileError::encryption_failed(Some(Box::new(std::io::Error::other(e.to_string()))))
-        })
+    let key = Key::<Aes256Gcm>::try_from(key).expect("key length validated");
+    let iv = Nonce::try_from(iv).expect("iv length validated");
+    let cipher = Aes256Gcm::new(&key);
+    cipher.encrypt(&iv, plaintext).map_err(|e| {
+        MajikFileError::encryption_failed(Some(Box::new(std::io::Error::other(e.to_string()))))
+    })
 }
 
 /// `Ok(None)` on authentication failure (stablelib `open` returning null).
 pub fn aes_gcm_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Option<Vec<u8>>> {
     check_key_iv("aes_gcm_decrypt", key, iv)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    Ok(cipher.decrypt(Nonce::from_slice(iv), ciphertext).ok())
+    let key = Key::<Aes256Gcm>::try_from(key).expect("key length validated");
+    let iv = Nonce::try_from(iv).expect("iv length validated");
+    let cipher = Aes256Gcm::new(&key);
+    Ok(cipher.decrypt(&iv, ciphertext).ok())
 }
 
 // ─── ML-KEM-768 ─────────────────────────────────────────────────────────────
@@ -94,13 +99,12 @@ pub fn ml_kem_encapsulate(recipient_public_key: &[u8]) -> Result<MlKemEncapsulat
             recipient_public_key.len()
         )));
     }
-    let ek_bytes: &[u8; ML_KEM_PK_LEN] = recipient_public_key.try_into().expect("length validated");
-    let ek = Ek768::from_bytes(ek_bytes.into());
+    let ek_bytes: MlKemKey<Ek768> = recipient_public_key.try_into().expect("length validated");
+    let ek = Ek768::new(&ek_bytes)
+        .map_err(|_| MajikFileError::invalid_input("ml_kem_encapsulate: invalid public key"))?;
 
     // encapsulate() returns (Ciphertext, SharedKey) — ciphertext FIRST.
-    let (ct, shared): (Ct768, _) = ek
-        .encapsulate(&mut OsRng)
-        .map_err(|_| MajikFileError::encryption_failed(None))?;
+    let (ct, shared): (Ct768, _) = ek.encapsulate();
 
     Ok(MlKemEncapsulation {
         shared_secret: Zeroizing::new(shared.as_slice().to_vec()),
@@ -126,22 +130,26 @@ pub fn ml_kem_decapsulate(
             recipient_secret_key.len()
         )));
     }
-    let dk_bytes: &[u8; ML_KEM_SK_LEN] = recipient_secret_key.try_into().expect("length validated");
-    let dk = Dk768::from_bytes(dk_bytes.into());
+    #[allow(deprecated)]
+    let dk_bytes: ml_kem::ml_kem_768::ExpandedDecapsulationKey =
+        recipient_secret_key.try_into().expect("length validated");
+    #[allow(deprecated)]
+    let dk = Dk768::from_expanded_bytes(&dk_bytes)
+        .map_err(|_| MajikFileError::invalid_input("ml_kem_decapsulate: invalid secret key"))?;
     let ct = Ct768::try_from(cipher_text).expect("length validated");
 
-    let shared = dk
-        .decapsulate(&ct)
-        .map_err(|_| MajikFileError::decryption_failed("ML-KEM decapsulation failed", None))?;
+    let shared = dk.decapsulate(&ct);
     Ok(Zeroizing::new(shared.as_slice().to_vec()))
 }
 
 /// Generate a random ML-KEM-768 keypair (1184-byte pk, 2400-byte sk).
 pub fn generate_ml_kem_keypair() -> MlKemKeypair {
-    // generate() → (DecapsulationKey, EncapsulationKey) — dk FIRST.
-    let (dk, ek): (Dk768, Ek768) = MlKem768::generate(&mut OsRng);
+    // generate_keypair() → (DecapsulationKey, EncapsulationKey) — dk FIRST.
+    let (dk, ek): (Dk768, Ek768) = MlKem768::generate_keypair();
+    #[allow(deprecated)]
+    let secret_key = dk.to_expanded_bytes().to_vec();
     MlKemKeypair {
-        public_key: ek.as_bytes().to_vec(),
-        secret_key: Zeroizing::new(dk.as_bytes().to_vec()),
+        public_key: ek.to_bytes().to_vec(),
+        secret_key: Zeroizing::new(secret_key),
     }
 }
