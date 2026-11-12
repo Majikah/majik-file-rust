@@ -428,7 +428,6 @@ fn dangerous_json_includes_plaintext_only_after_hydrate() {
     assert_eq!(base64_to_array(&d.decrypted_base64.unwrap()).unwrap(), TEXT);
 }
 
-
 #[test]
 fn legacy_stamp_nested_file_json_defaults_missing_schema_and_crypto_suite() {
     let identity = test_identity("legacy-stamp");
