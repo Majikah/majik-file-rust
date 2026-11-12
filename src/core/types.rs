@@ -323,11 +323,18 @@ pub struct MajikFileJson {
     /// Hex 12-byte IV (audit only; the binary header is authoritative).
     pub encryption_iv: String,
     pub participants: Vec<MajikKeyAddress>,
+    /// Legacy rows predate the explicit crypto-suite fields. They were all
+    /// written with ML-KEM-768 + AES-256-GCM, so absence is safely normalized
+    /// to that historical suite before validation or stamp-row hydration.
+    #[serde(default = "default_kem_alg")]
     pub kem_alg: String,
+    #[serde(default = "default_cipher_alg")]
     pub cipher_alg: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_level: Option<CompressionLevel>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Accepted when reading records, but omitted from serialized JSON to
+    /// match the current TypeScript MajikFile.toJSON() contract.
+    #[serde(default, skip_serializing)]
     pub compression_alg: Option<String>,
     pub timestamp: Option<String>,
     pub last_update: Option<String>,
@@ -339,6 +346,14 @@ pub struct MajikFileJson {
 pub const DEFAULT_KEM_ALG: &str = CRYPTO_SUITE.kem_alg;
 pub const DEFAULT_CIPHER_ALG: &str = CRYPTO_SUITE.cipher_alg;
 pub const DEFAULT_COMPRESSION_ALG: &str = COMPRESSION_SUITE.alg;
+
+fn default_kem_alg() -> String {
+    DEFAULT_KEM_ALG.to_string()
+}
+
+fn default_cipher_alg() -> String {
+    DEFAULT_CIPHER_ALG.to_string()
+}
 
 /// `toDangerousJSON()` shape — includes plaintext. Never persist.
 #[derive(Debug, Clone, Serialize)]

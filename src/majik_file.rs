@@ -776,7 +776,7 @@ impl MajikFile {
             kem_alg: self.kem_alg.clone(),
             cipher_alg: self.cipher_alg.clone(),
             compression_level: self.compression_level,
-            compression_alg: self.compression_alg.clone(),
+            compression_alg: None,
             timestamp: self.timestamp.clone(),
             last_update: self.last_update.clone(),
             signature: self.signature.clone(),
