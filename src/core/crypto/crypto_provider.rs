@@ -1,6 +1,6 @@
 //! crypto_provider.rs — AES-256-GCM + ML-KEM-768 primitives.
 //!
-//! @stablelib/aes+gcm → aes-gcm 0.10 · @noble/post-quantum → ml-kem 0.2.x
+//! @stablelib/aes+gcm → aes-gcm 0.11 · @noble/post-quantum → ml-kem 0.3.x
 //! (2400-byte expanded secret key) · crypto.getRandomValues → OsRng.
 
 use aes_gcm::{

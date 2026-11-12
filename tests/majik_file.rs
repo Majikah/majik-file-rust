@@ -346,6 +346,11 @@ fn custom_codec_is_stamped_and_required_on_decrypt() {
         Some("xor-test")
     );
 
+    let metadata = f.to_json().unwrap();
+    assert!(metadata.compression_alg.is_none());
+    let serialized = serde_json::to_value(metadata).unwrap();
+    assert!(serialized.get("compression_alg").is_none());
+
     // Without the codec → UNSUPPORTED_COMPRESSION_ALG
     let err = f.decrypt_binary(&id, None).unwrap_err();
     assert_eq!(code(err), MajikFileErrorCode::UnsupportedCompressionAlg);
@@ -423,6 +428,59 @@ fn dangerous_json_includes_plaintext_only_after_hydrate() {
     assert_eq!(base64_to_array(&d.decrypted_base64.unwrap()).unwrap(), TEXT);
 }
 
+
+#[test]
+fn legacy_stamp_nested_file_json_defaults_missing_schema_and_crypto_suite() {
+    let identity = test_identity("legacy-stamp");
+    let file = MajikFile::create(opts(TEXT, &identity)).unwrap();
+    let binary = file.to_mjkb().unwrap().to_vec();
+
+    let mut file_json = serde_json::to_value(file.to_json().unwrap()).unwrap();
+    let fields = file_json.as_object_mut().unwrap();
+    fields.remove("schema_version");
+    fields.remove("kem_alg");
+    fields.remove("cipher_alg");
+
+    // Same outer shape as MajikSignatureStampJSON in the TypeScript client:
+    // the legacy MajikFile record is nested under camelCase `fileJson`.
+    let stamp_row = serde_json::json!({
+        "id": file.id(),
+        "kind": "text",
+        "name": "legacy.txt",
+        "mimeType": "text/plain",
+        "sizeBytes": TEXT.len(),
+        "fingerprint": identity.fingerprint,
+        "data": array_to_base64(&binary),
+        "timestamp": "2025-01-01T00:00:00.000Z",
+        "lastUpdate": "2025-01-01T00:00:00.000Z",
+        "fileJson": file_json
+    });
+
+    let restored_json: MajikFileJson =
+        serde_json::from_value(stamp_row["fileJson"].clone()).unwrap();
+
+    assert_eq!(restored_json.schema_version, LEGACY_SCHEMA_VERSION);
+    assert_eq!(restored_json.kem_alg, DEFAULT_KEM_ALG);
+    assert_eq!(restored_json.cipher_alg, DEFAULT_CIPHER_ALG);
+
+    let restored = MajikFile::from_json(restored_json, Some(binary)).unwrap();
+    assert_eq!(restored.decrypt_binary(&identity, None).unwrap(), TEXT);
+}
+
+#[test]
+fn current_schema_json_defaults_missing_crypto_suite_fields() {
+    let identity = test_identity("current-missing-suite");
+    let file = MajikFile::create(opts(TEXT, &identity)).unwrap();
+    let mut json = serde_json::to_value(file.to_json().unwrap()).unwrap();
+    let fields = json.as_object_mut().unwrap();
+    fields.remove("kem_alg");
+    fields.remove("cipher_alg");
+
+    let parsed: MajikFileJson = serde_json::from_value(json).unwrap();
+    assert_eq!(parsed.schema_version, FILE_SCHEMA_VERSION);
+    assert_eq!(parsed.kem_alg, DEFAULT_KEM_ALG);
+    assert_eq!(parsed.cipher_alg, DEFAULT_CIPHER_ALG);
+}
 // ── Hydration, batch, secure lock ──────────────────────────────────────────
 
 #[test]

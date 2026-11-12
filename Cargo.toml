@@ -22,8 +22,8 @@ tauri = ["dep:tauri"]
 # AES-256-GCM (RustCrypto) — replaces @stablelib/aes + @stablelib/gcm
 aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 
-# ML-KEM-768 — replaces @noble/post-quantum. 0.2.x is REQUIRED: it uses the
-# 2400-byte expanded secret key that noble uses (0.3.0-rc uses a 64-byte seed).
+# ML-KEM-768 — replaces @noble/post-quantum. This stable release uses the
+# 2400-byte expanded secret-key encoding shared with the TypeScript SDK.
 ml-kem = { version = "0.3.2", features = ["getrandom"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # SHA-256 — replaces @stablelib/sha256
