@@ -449,7 +449,7 @@ fn legacy_stamp_nested_file_json_defaults_missing_schema_and_crypto_suite() {
         "name": "legacy.txt",
         "mimeType": "text/plain",
         "sizeBytes": TEXT.len(),
-        "fingerprint": identity.fingerprint,
+        "fingerprint": identity.fingerprint.clone(),
         "data": array_to_base64(&binary),
         "timestamp": "2025-01-01T00:00:00.000Z",
         "lastUpdate": "2025-01-01T00:00:00.000Z",
