@@ -2,7 +2,10 @@
 //!
 //! Post-quantum file encryption for the Majikah ecosystem (ML-KEM-768 +
 //! AES-256-GCM + Zstd) in the `.mjkb` binary format. Pure Rust port of the
-//! `@majikah/majik-file` TypeScript SDK (v0.7.1).
+//! `@majikah/majik-file` TypeScript SDK (v0.8.0).
+//!
+//! Encryption accepts `MajikFileEncryptionIdentity` (public material only);
+//! decryption uses `MajikFileDecryptIdentity` or a full `MajikFileIdentity`.
 //!
 //! Layout mirrors the TypeScript `src/` tree 1:1:
 //!
