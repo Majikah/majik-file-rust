@@ -28,7 +28,7 @@ pub fn as_recipient(i: &MajikFileIdentity) -> MajikFileRecipient {
 }
 
 pub fn opts(data: &[u8], identity: &MajikFileIdentity) -> MajikFileCreateOptions {
-    let mut o = MajikFileCreateOptions::new(data.to_vec(), "user-1", identity.clone());
+    let mut o = MajikFileCreateOptions::new(data.to_vec(), "user-1", identity);
     o.original_name = Some("hello.txt".to_string());
     o
 }

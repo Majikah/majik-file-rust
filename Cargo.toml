@@ -1,6 +1,6 @@
 [package]
 name = "majik-file"
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 description = "Majik File is the core cryptographic engine for secure file handling in the Majikah ecosystem. It provides a post-quantum secure MJKB format designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms."
 license = "Apache-2.0"
@@ -24,22 +24,22 @@ aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 
 # ML-KEM-768 — replaces @noble/post-quantum. This stable release uses the
 # 2400-byte expanded secret-key encoding shared with the TypeScript SDK.
-ml-kem = { version = "0.3.2", features = ["getrandom"] }
+ml-kem = { version = "0.3.4", features = ["getrandom"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # SHA-256 — replaces @stablelib/sha256
-sha2 = "0.10"
+sha2 = "0.11.1"
 # Pure-Rust zstd (all 22 levels) — replaces @bokuweb/zstd-wasm
-structured-zstd = { version = "0.2.1", default-features = false, features = ["std", "hash"] }
+structured-zstd = { version = "0.4.4", default-features = false, features = ["std", "hash"] }
 # Best-effort memory wiping (only where it actually matters)
-zeroize = { version = "1.9.1", features = ["zeroize_derive"] }
+zeroize = { version = "1.9.2", features = ["zeroize_derive"] }
 # JSON payloads / records
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 base64 = "0.23.1"
 hex = "0.4"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-thiserror = "2"
+uuid = { version = "1.29.3", features = ["v4"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+thiserror = "2.0.21"
 # Optional Tauri v2 command macros and command integration.
 tauri = { version = "2", default-features = false, optional = true }
 

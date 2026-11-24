@@ -78,7 +78,7 @@ pub struct EncryptCoreResult {
 
 pub struct EncryptCoreInput<'a> {
     pub data: &'a [u8],
-    pub identity: &'a MajikFileIdentity,
+    pub identity: &'a MajikFileEncryptionIdentity,
     pub recipients: &'a [MajikFileRecipient],
     pub original_name: Option<&'a str>,
     pub mime_type: Option<&'a str>,

@@ -91,7 +91,22 @@ pub trait SignatureProvider {
 
 // ─── Identities & recipients ────────────────────────────────────────────────
 
-/// File owner's full identity. The secret key is wiped on drop.
+/// Public identity material sufficient to create an encrypted .mjkb.
+///
+/// Encryption only needs the issuer's public key and never requires the
+/// issuer's ML-KEM secret key. This lets callers encrypt for registered
+/// recipients without unlocking or copying private material into the
+/// encryption flow.
+#[derive(Debug, Clone)]
+pub struct MajikFileEncryptionIdentity {
+    pub public_key: MajikKeyAddress,
+    pub fingerprint: MajikKeyFingerprint,
+    /// ML-KEM-768 public key (1184 bytes).
+    pub ml_kem_public_key: Vec<u8>,
+}
+
+/// Full identity material. The secret key is used only for decryption and
+/// is wiped on drop.
 #[derive(Clone)]
 pub struct MajikFileIdentity {
     pub public_key: MajikKeyAddress,
@@ -109,6 +124,37 @@ impl std::fmt::Debug for MajikFileIdentity {
             .field("fingerprint", &self.fingerprint)
             .field("ml_kem_secret_key", &"<redacted>")
             .finish()
+    }
+}
+
+/// Convert a full identity into its public encryption material.
+///
+/// The owned secret key is dropped and zeroized during this conversion.
+impl From<MajikFileIdentity> for MajikFileEncryptionIdentity {
+    fn from(identity: MajikFileIdentity) -> Self {
+        let MajikFileIdentity {
+            public_key,
+            fingerprint,
+            ml_kem_public_key,
+            ml_kem_secret_key,
+        } = identity;
+        drop(ml_kem_secret_key);
+        Self {
+            public_key,
+            fingerprint,
+            ml_kem_public_key,
+        }
+    }
+}
+
+/// Borrow the public portion of a full identity without consuming it.
+impl From<&MajikFileIdentity> for MajikFileEncryptionIdentity {
+    fn from(identity: &MajikFileIdentity) -> Self {
+        Self {
+            public_key: identity.public_key.clone(),
+            fingerprint: identity.fingerprint.clone(),
+            ml_kem_public_key: identity.ml_kem_public_key.clone(),
+        }
     }
 }
 
@@ -368,7 +414,7 @@ pub struct MajikFileDangerousJson {
 pub struct MajikFileCreateOptions {
     pub data: Vec<u8>,
     pub user_id: String,
-    pub identity: MajikFileIdentity,
+    pub identity: MajikFileEncryptionIdentity,
     /// Additional recipients; non-empty → group .mjkb.
     pub recipients: Vec<MajikFileRecipient>,
     pub original_name: Option<String>,
@@ -381,11 +427,15 @@ pub struct MajikFileCreateOptions {
 }
 
 impl MajikFileCreateOptions {
-    pub fn new(data: Vec<u8>, user_id: impl Into<String>, identity: MajikFileIdentity) -> Self {
+    pub fn new(
+        data: Vec<u8>,
+        user_id: impl Into<String>,
+        identity: impl Into<MajikFileEncryptionIdentity>,
+    ) -> Self {
         Self {
             data,
             user_id: user_id.into(),
-            identity,
+            identity: identity.into(),
             recipients: Vec::new(),
             original_name: None,
             mime_type: None,

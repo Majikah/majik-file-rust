@@ -156,6 +156,30 @@ fn group_roundtrip_for_every_participant() {
 }
 
 #[test]
+fn public_only_identity_can_encrypt_group_for_issuer_and_recipients() {
+    let issuer = test_identity("issuer");
+    let recipient = test_identity("recipient");
+
+    // Deliberately construct the issuer identity without any secret-key field.
+    let public_identity = MajikFileEncryptionIdentity {
+        public_key: issuer.public_key.clone(),
+        fingerprint: issuer.fingerprint.clone(),
+        ml_kem_public_key: issuer.ml_kem_public_key.clone(),
+    };
+
+    let mut options = MajikFileCreateOptions::new(TEXT.to_vec(), "user-1", public_identity);
+    options.original_name = Some("public-only.txt".into());
+    options.recipients = vec![as_recipient(&recipient)];
+
+    let file = MajikFile::create(options).unwrap();
+
+    assert!(file.is_group());
+    assert_eq!(file.participants().len(), 2);
+    assert_eq!(file.decrypt_binary(&issuer, None).unwrap(), TEXT);
+    assert_eq!(file.decrypt_binary(&recipient, None).unwrap(), TEXT);
+}
+
+#[test]
 fn group_non_participant_is_rejected() {
     let owner = test_identity("owner");
     let r1 = test_identity("r1");

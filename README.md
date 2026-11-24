@@ -93,10 +93,13 @@ majik-file = "1"
 Use key material from your application's established Majik Key identity flow. Do not use placeholder key material in production.
 
 ~~~rust
-use majik_file::{MajikFile, MajikFileCreateOptions};
+use majik_file::{
+    MajikFile, MajikFileCreateOptions, MajikFileEncryptionIdentity, MajikFileIdentity,
+};
 
+let encryption_identity = MajikFileEncryptionIdentity::from(&identity);
 let mut options =
-    MajikFileCreateOptions::new(file_bytes, user_id, identity.clone());
+    MajikFileCreateOptions::new(file_bytes, user_id, encryption_identity);
 options.original_name = Some("report.pdf".to_string());
 options.mime_type = Some("application/pdf".to_string());
 
@@ -109,6 +112,12 @@ let recovered = file.decrypt_binary(&identity, None)?;
 ~~~
 
 For a group file, populate `options.recipients` with `MajikFileRecipient` values before calling `MajikFile::create()`.
+
+### Encryption and decryption identities
+
+`MajikFileEncryptionIdentity` contains only the public address, fingerprint and ML-KEM public key required to create an encrypted file. It intentionally has no secret-key field. `MajikFileIdentity` retains the private ML-KEM secret key for operations that require decryption.
+
+`MajikFileCreateOptions::new()` accepts either a public-only identity or a full `MajikFileIdentity` through `Into<MajikFileEncryptionIdentity>`. Prefer converting by reference when the same full identity will also be used to decrypt the resulting file. The owned conversion drops and zeroizes the private key because encryption does not need it.
 
 ## Restoring metadata and legacy records
 
@@ -169,7 +178,7 @@ The persisted metadata contract and `.mjkb` wire format are kept compatible. Hos
 | Browser `Blob` output | Borrowed encrypted bytes; clone when ownership is needed |
 | Async WASM Zstandard initialization | Synchronous native Zstandard |
 | Browser Canvas image conversion | Frontend preprocessing or a `MajikFileHooks` implementation |
-| Concrete `MajikKey` accepted for decryption | `MajikFileDecryptIdentity` or borrowed `MajikFileIdentity` |
+| `MajikFileEncryptionIdentity` for creation; secret material only for decryption | `MajikFileEncryptionIdentity` for creation; `MajikFileDecryptIdentity` or full `MajikFileIdentity` for decryption |
 | Concrete `MajikSignature` type | Generic `SignatureProvider` abstraction |
 
 Rust batch decryption is sequential because the crypto work is CPU-bound. Applications can parallelize independent files at the call site when appropriate.

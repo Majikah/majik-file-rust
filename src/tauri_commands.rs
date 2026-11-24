@@ -29,7 +29,7 @@
 //! ```typescript
 //! import { invoke } from '@tauri-apps/api/core';
 //!
-//! const { publicKey, secretKey } = await invoke('cmd_generate_ml_kem_keypair');
+//! const { publicKey } = await invoke('cmd_generate_ml_kem_keypair');
 //!
 //! const { mjkbBytes, metadata } = await invoke('cmd_encrypt_file', {
 //!   req: {
@@ -39,7 +39,6 @@
 //!       publicKey: publicKeyString,
 //!       fingerprint,
 //!       mlKemPublicKey: Array.from(mlKemPubKeyBytes),
-//!       mlKemSecretKey: Array.from(mlKemSecKeyBytes),
 //!     },
 //!   },
 //! });
@@ -50,34 +49,31 @@ use serde::{Deserialize, Serialize};
 use crate::core::crypto::crypto_provider::generate_ml_kem_keypair;
 use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::types::{
-    MajikFileCreateOptions, MajikFileDecryptIdentity, MajikFileIdentity, MajikFileRecipient,
+    MajikFileCreateOptions, MajikFileDecryptIdentity, MajikFileEncryptionIdentity,
+    MajikFileRecipient,
 };
 use crate::core::utils::{format_bytes, infer_mime_type_from_filename, sha256_base64, sha256_hex};
 use crate::majik_file::MajikFile;
 
 // ─── Serialisable DTOs ────────────────────────────────────────────────────────
 
-/// Passed from TypeScript → Rust for identity fields.
-#[derive(Deserialize)]
+/// Public identity material passed from TypeScript → Rust for encryption.
+/// Decryption commands accept private key material separately.
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IdentityPayload {
+pub struct EncryptionIdentityPayload {
     pub public_key: String,
     pub fingerprint: String,
     /// ML-KEM-768 public key as a byte array.
     pub ml_kem_public_key: Vec<u8>,
-    /// ML-KEM-768 secret key as a byte array.
-    /// Only required for decryption commands.
-    #[serde(default)]
-    pub ml_kem_secret_key: Vec<u8>,
 }
 
-impl From<IdentityPayload> for MajikFileIdentity {
-    fn from(p: IdentityPayload) -> Self {
-        MajikFileIdentity {
+impl From<EncryptionIdentityPayload> for MajikFileEncryptionIdentity {
+    fn from(p: EncryptionIdentityPayload) -> Self {
+        MajikFileEncryptionIdentity {
             public_key: p.public_key,
             fingerprint: p.fingerprint,
             ml_kem_public_key: p.ml_kem_public_key,
-            ml_kem_secret_key: Zeroizing::new(p.ml_kem_secret_key),
         }
     }
 }
@@ -127,7 +123,7 @@ pub struct EncryptResult {
 pub struct EncryptRequest {
     pub data: Vec<u8>,
     pub user_id: String,
-    pub identity: IdentityPayload,
+    pub identity: EncryptionIdentityPayload,
     #[serde(default)]
     pub original_name: Option<String>,
     #[serde(default)]
