@@ -35,4 +35,5 @@ pub use crate::core::mjkb_codec::*;
 pub use crate::core::types::*;
 pub use crate::core::utils::*;
 pub use crate::core::validator::*;
+pub use crate::core::streaming::*;
 pub use crate::majik_file::*;
