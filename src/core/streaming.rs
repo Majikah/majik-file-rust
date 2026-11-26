@@ -693,8 +693,8 @@ impl<'a, R: Read> ChunkDecryptReader<'a, R> {
         })?;
         let nonce = nonce_for(&self.nonce_base, self.chunk_count);
         let aad = chunk_aad(&self.payload_hash, self.chunk_count, plaintext_len);
-        let plaintext = aes_gcm_decrypt_with_aad(self.key, &nonce, &ciphertext, &aad)
-            .map_err(as_io_error)?;
+        let plaintext =
+            aes_gcm_decrypt_with_aad(self.key, &nonce, &ciphertext, &aad).map_err(as_io_error)?;
         let Some(plaintext) = plaintext else {
             self.authentication_failed = true;
             return Err(io::Error::new(
