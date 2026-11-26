@@ -771,3 +771,116 @@ impl<W: Write> Write for HashingWriter<'_, '_, W> {
         self.writer.flush()
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    use crate::core::crypto::crypto_provider::generate_ml_kem_keypair;
+    use crate::core::types::{MajikFileDecryptIdentity, MajikFileEncryptionIdentity};
+
+    fn test_identity() -> (MajikFileEncryptionIdentity, Vec<u8>, String) {
+        let keypair = generate_ml_kem_keypair();
+        let fingerprint = "streaming-test-fingerprint".to_string();
+        (
+            MajikFileEncryptionIdentity {
+                public_key: "streaming-test-public-key".to_string(),
+                fingerprint: fingerprint.clone(),
+                ml_kem_public_key: keypair.public_key,
+            },
+            keypair.secret_key.to_vec(),
+            fingerprint,
+        )
+    }
+
+    fn roundtrip(compression: bool) {
+        let (identity, secret_key, fingerprint) = test_identity();
+        let input = (0..(MIN_STREAM_CHUNK_SIZE + 19_337))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut source = Cursor::new(input.clone());
+        let mut encrypted = Vec::new();
+        let mut encrypt_options = StreamingOptions::default();
+        encrypt_options.chunk_size = MIN_STREAM_CHUNK_SIZE;
+        encrypt_options.compression = Some(compression);
+        encrypt_options.total_bytes = Some(input.len() as u64);
+
+        let encrypted_result = encrypt_reader_to_writer(
+            &mut source,
+            &mut encrypted,
+            &identity,
+            &[],
+            Some("streaming-test.bin"),
+            Some("application/octet-stream"),
+            &mut encrypt_options,
+        )
+        .expect("stream encryption should succeed");
+
+        assert_eq!(encrypted[4], MJKB_VERSION_STREAMING);
+        assert_eq!(encrypted_result.original_bytes, input.len() as u64);
+        assert!(encrypted_result.chunks >= 1);
+
+        let mut encrypted_source = Cursor::new(encrypted);
+        let mut plaintext = Vec::new();
+        let mut decrypt_options = StreamingOptions::default();
+        let decrypted_result = decrypt_reader_to_writer(
+            &mut encrypted_source,
+            &mut plaintext,
+            MajikFileDecryptIdentity::new(&fingerprint, &secret_key),
+            &mut decrypt_options,
+        )
+        .expect("stream decryption should succeed");
+
+        assert_eq!(plaintext, input);
+        assert_eq!(decrypted_result.original_bytes, input.len() as u64);
+        assert_eq!(decrypted_result.file_hash, encrypted_result.file_hash);
+    }
+
+    #[test]
+    fn v3_roundtrips_without_compression() {
+        roundtrip(false);
+    }
+
+    #[test]
+    fn v3_roundtrips_with_zstd_compression() {
+        roundtrip(true);
+    }
+
+    #[test]
+    fn v3_rejects_tampered_manifest_tag() {
+        let (identity, secret_key, fingerprint) = test_identity();
+        let input = vec![0x5au8; MIN_STREAM_CHUNK_SIZE + 7];
+        let mut source = Cursor::new(input);
+        let mut encrypted = Vec::new();
+        let mut options = StreamingOptions::default();
+        options.chunk_size = MIN_STREAM_CHUNK_SIZE;
+        options.compression = Some(false);
+        encrypt_reader_to_writer(
+            &mut source,
+            &mut encrypted,
+            &identity,
+            &[],
+            None,
+            Some("application/octet-stream"),
+            &mut options,
+        )
+        .expect("stream encryption should succeed");
+
+        let last = encrypted.last_mut().expect("manifest tag exists");
+        *last ^= 0x01;
+
+        let mut encrypted_source = Cursor::new(encrypted);
+        let mut plaintext = Vec::new();
+        let mut decrypt_options = StreamingOptions::default();
+        let result = decrypt_reader_to_writer(
+            &mut encrypted_source,
+            &mut plaintext,
+            MajikFileDecryptIdentity::new(&fingerprint, &secret_key),
+            &mut decrypt_options,
+        );
+        assert!(result.is_err());
+    }
+}
