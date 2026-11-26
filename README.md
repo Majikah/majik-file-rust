@@ -258,4 +258,22 @@ A wrong ML-KEM secret key normally produces a different shared secret rather tha
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+[Apache-2.0](LICENSE) — free for personal and commercial use.
+
+---
+
+## Author
+
+Developed by **Josef Elijah Fabian (Zelijah)** | [Majikah Solutions OPC](https://majikah.solutions/about)
+
+**Developer**: [Josef Elijah Fabian](https://github.com/jedlsf)
+**GitHub**: [https://github.com/Majikah](https://github.com/Majikah)
+**Project Repository**: [https://github.com/Majikah/majik-file-rust](https://github.com/Majikah/majik-file-rust)
+
+---
+
+## Contact
+
+- **Business Email**: [business@majikah.solutions](mailto:business@majikah.solutions)
+- **Official Website**: [https://www.thezelijah.world](https://www.thezelijah.world)
+- **Majikah Ecosystem**: [https://majikah.solutions](https://majikah.solutions)
