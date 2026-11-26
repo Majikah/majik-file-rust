@@ -14,8 +14,6 @@ use ml_kem::{
     kem::{Decapsulate, Encapsulate, Kem, KeyExport},
     Ciphertext, DecapsulationKey, EncapsulationKey, MlKem768,
 };
-use getrandom::SysRng;
-use rand_core::TryRng;
 
 use crate::core::crypto::constants::{
     AES_KEY_LEN, IV_LENGTH, ML_KEM_CT_LEN, ML_KEM_PK_LEN, ML_KEM_SK_LEN,
@@ -49,8 +47,7 @@ pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>> {
         ));
     }
     let mut buf = vec![0u8; len];
-    let mut rng = SysRng;
-    rng.try_fill_bytes(&mut buf).map_err(|error| {
+    getrandom::fill(&mut buf).map_err(|error| {
         MajikFileError::encryption_failed(Some(Box::new(error)))
     })?;
     Ok(buf)
