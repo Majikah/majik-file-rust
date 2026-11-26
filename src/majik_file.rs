@@ -1104,7 +1104,10 @@ impl MajikFile {
 
     /// Structural validation beyond the magic-byte check. Does NOT decrypt.
     pub fn is_valid_mjkb(data: &[u8]) -> bool {
-        if data.len() < 23 || data[..4] != MJKB_MAGIC {
+        if data.len() < 23
+            || data[..4] != MJKB_MAGIC
+            || !MJKB_SUPPORTED_VERSIONS.contains(&data[4])
+        {
             return false;
         }
         let o = 17; // 4 magic + 1 version + 12 IV
