@@ -20,6 +20,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::io::Cursor;
 
 use jiff::Timestamp;
 
@@ -34,6 +35,7 @@ use crate::core::mjkb_codec::{decode_mjkb, encode_mjkb, resolve_aes_key_from_pay
 use crate::core::types::*;
 use crate::core::utils::*;
 use crate::core::validator::MajikFileValidator;
+use crate::core::streaming::{decrypt_reader_to_writer, StreamingOptions};
 
 /// MIME type used when exporting .mjkb bytes.
 pub const MJKB_MIME_TYPE: &str = "application/vnd.majikah.bundle";
@@ -576,6 +578,22 @@ impl MajikFile {
         )?;
 
         let raw = Self::strip_mjks_trailer(source);
+
+        // V3 uses independently authenticated chunk records. Keep the v1/v2
+        // one-shot path below byte-for-byte unchanged.
+        if raw.get(4) == Some(&MJKB_VERSION_STREAMING) {
+            let mut cursor = Cursor::new(raw);
+            let mut plaintext = Vec::new();
+            let mut streaming_options = StreamingOptions::default();
+            let streamed = decrypt_reader_to_writer(
+                &mut cursor,
+                &mut plaintext,
+                *identity,
+                &mut streaming_options,
+            )?;
+            return Ok((plaintext, AnyMjkbPayload::V3(streamed.payload)));
+        }
+
         let decoded = decode_mjkb(raw)?;
 
         let aes_key = resolve_aes_key_from_payload(
@@ -1184,8 +1202,11 @@ impl MajikFile {
     }
 
     fn group_has_fingerprint(payload: &AnyMjkbPayload, fingerprint: &str) -> bool {
-        use crate::core::types::{MjkbPayloadV1, MjkbPayloadV2};
+        use crate::core::types::{MjkbPayloadV1, MjkbPayloadV2, MjkbPayloadV3};
         match payload {
+            AnyMjkbPayload::V3(MjkbPayloadV3::Group(p)) => {
+                p.keys.iter().any(|k| k.fingerprint == fingerprint)
+            }
             AnyMjkbPayload::V2(MjkbPayloadV2::Group(p)) => {
                 p.keys.iter().any(|k| k.fingerprint == fingerprint)
             }
