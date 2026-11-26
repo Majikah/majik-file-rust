@@ -415,7 +415,7 @@ fn write_encrypt<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<()> {
 }
 
 fn as_io_error(error: MajikFileError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error)
+    io::Error::other(error)
 }
 
 struct ChunkEncryptWriter<'a, W: Write> {
@@ -495,6 +495,12 @@ impl<'a, W: Write> ChunkEncryptWriter<'a, W> {
             .map_err(|error| MajikFileError::encryption_failed(Some(Box::new(error))))?;
 
         Ok((self.chunk_count, self.compressed_bytes))
+    }
+}
+
+impl<W: Write> Drop for ChunkEncryptWriter<'_, W> {
+    fn drop(&mut self) {
+        self.buffer.zeroize();
     }
 }
 
@@ -638,6 +644,12 @@ impl<'a, R: Read> ChunkDecryptReader<'a, R> {
         self.compressed_bytes = self.compressed_bytes.checked_add(plaintext_len as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "MJKB stream length overflow"))?;
         Ok(())
+    }
+}
+
+impl<R: Read> Drop for ChunkDecryptReader<'_, R> {
+    fn drop(&mut self) {
+        self.buffer.zeroize();
     }
 }
 
