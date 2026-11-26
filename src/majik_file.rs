@@ -21,7 +21,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 
-use chrono::{SecondsFormat, Utc};
+use jiff::Timestamp;
 
 use crate::core::compressor::majik_compressor::{CompressionLevel, MajikCompressor, ZSTD_CODEC};
 use crate::core::crypto::constants::*;
@@ -136,7 +136,7 @@ pub struct CanDecryptMjkbOptions {
 }
 
 fn now_iso() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 fn blank(s: &Option<String>) -> bool {
