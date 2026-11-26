@@ -11,8 +11,9 @@ It creates self-contained `.mjkb` files using **ML-KEM-768 (FIPS 203) + AES-256-
 
 ## Compatibility contract
 
-- New files use **MJKB v2** (format byte `0x02`).
-- Existing **MJKB v1** files (format byte `0x01`) remain readable.
+- Existing buffer-based APIs continue writing **MJKB v2** (format byte `0x02`) so current callers retain their existing output format.
+- New reader/writer streaming APIs write **MJKB v3** (format byte `0x03`).
+- Existing **MJKB v1** and **MJKB v2** files remain readable; v3 adds a separate decoder path and does not reinterpret legacy ciphertext.
 - The JSON record schema is independent of the binary version. Current records use `schema_version: 1`; an absent schema-version field is interpreted as legacy schema `0`.
 - Legacy JSON records may omit `kem_alg` and `cipher_alg`. All pre-existing records used `ML-KEM-768` and `AES-256-GCM`, so Rust deserialization restores these historical defaults before file or nested stamp-row hydration.
 - The binary is authoritative for the IV and compression flag/algorithm. The JSON record contains metadata, not the encrypted binary.
@@ -72,6 +73,53 @@ The fixed header is 21 bytes:
 ~~~
 
 The optional v2 `ca` field identifies a non-default compression codec. An absent `ca` means `zstd`. Legacy v1 payloads used `c` instead of `z`; for those files, decompression is inferred from MIME type.
+
+## MJKB v3 streaming format
+
+MJKB v3 is used by the reader/writer streaming APIs. The legacy MajikFile::create and byte-buffer APIs remain on v2 for compatibility.
+
+The 21-byte prefix is unchanged: magic, version, 12-byte nonce base, and big-endian payload length, followed by the v3 JSON payload. The encrypted stream then contains:
+
+1. Repeated records: a big-endian u32 ciphertext length followed by one AES-256-GCM ciphertext and its 16-byte tag.
+2. Each chunk uses a distinct nonce derived from the random 96-bit nonce base and monotonically increasing 64-bit chunk index.
+3. Chunk AAD binds the payload hash, chunk index, and plaintext chunk length.
+4. A zero-length record marks the end of chunks, followed by an authenticated manifest containing chunk count, compressed-stream length, original plaintext length, and original SHA-256 digest.
+5. A final AES-256-GCM authentication tag authenticates the manifest using the next nonce counter value.
+
+The manifest is mandatory. Missing chunks, reordered/duplicated records, altered chunk lengths, truncation, a modified manifest, and trailing bytes are rejected. Output should be written to a temporary destination and published only after decryption completes and the manifest and plaintext digest validate. The Tauri streaming commands follow this pattern.
+
+The default chunk size is 1 MiB (configurable from 64 KiB through 8 MiB). V3 uses streaming Zstandard when compression is enabled. The Zstandard decoder window memory is separate from the chunk buffer and remains governed by its decoder settings.
+
+### Reader/writer API
+
+~~~rust
+use std::io::{BufReader, BufWriter};
+use majik_file::{
+    encrypt_reader_to_writer, decrypt_reader_to_writer,
+    MajikFileEncryptionIdentity, MajikFileDecryptIdentity, StreamingOptions,
+};
+
+let mut input = BufReader::new(std::fs::File::open("input.bin")?);
+let mut encrypted = BufWriter::new(std::fs::File::create("output.mjkb")?);
+let mut options = StreamingOptions::default();
+
+let result = encrypt_reader_to_writer(
+    &mut input,
+    &mut encrypted,
+    &encryption_identity,
+    &[],
+    Some("input.bin"),
+    Some("application/octet-stream"),
+    &mut options,
+)?;
+encrypted.flush()?;
+~~~
+
+For decryption, use decrypt_reader_to_writer with the recipient fingerprint and ML-KEM secret key. Its reader must contain an MJKB v3 stream. The existing MajikFile::decrypt and Tauri byte-buffer commands continue to support v1/v2 files; those legacy formats are not automatically converted.
+
+### Tauri path commands
+
+When the tauri feature is enabled, cmd_encrypt_file_streaming and cmd_decrypt_file_streaming accept input/output filesystem paths. They do not transfer whole-file byte arrays through IPC, and they write to a sibling temporary file before renaming the completed output.
 
 ## Compression
 
