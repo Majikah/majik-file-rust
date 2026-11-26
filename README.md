@@ -11,9 +11,10 @@ It creates self-contained `.mjkb` files using **ML-KEM-768 (FIPS 203) + AES-256-
 
 ## Compatibility contract
 
-- Existing buffer-based APIs continue writing **MJKB v2** (format byte `0x02`) so current callers retain their existing output format.
-- New reader/writer streaming APIs write **MJKB v3** (format byte `0x03`).
-- Existing **MJKB v1** and **MJKB v2** files remain readable; v3 adds a separate decoder path and does not reinterpret legacy ciphertext.
+- New encryption through `MajikFile::create` writes **MJKB v3** (format byte `0x03`).
+- New reader/writer streaming APIs also write **MJKB v3**.
+- `MajikFile::create_v2` is available as an explicit compatibility option for older consumers; custom legacy compression codecs currently use this v2 path.
+- Existing **MJKB v1** and **MJKB v2** files remain readable. Decryption detects the version from the binary header.
 - The JSON record schema is independent of the binary version. Current records use `schema_version: 1`; an absent schema-version field is interpreted as legacy schema `0`.
 - Legacy JSON records may omit `kem_alg` and `cipher_alg`. All pre-existing records used `ML-KEM-768` and `AES-256-GCM`, so Rust deserialization restores these historical defaults before file or nested stamp-row hydration.
 - The binary is authoritative for the IV and compression flag/algorithm. The JSON record contains metadata, not the encrypted binary.
@@ -72,11 +73,11 @@ The fixed header is 21 bytes:
 }
 ~~~
 
-The optional v2 `ca` field identifies a non-default compression codec. An absent `ca` means `zstd`. Legacy v1 payloads used `c` instead of `z`; for those files, decompression is inferred from MIME type.
+The optional v2 `ca` field identifies a non-default compression codec. An absent `ca` means `zstd`. V3 standardizes its streaming compression suite on Zstandard. Legacy v1 payloads used `c` instead of `z`; for those files, decompression is inferred from MIME type.
 
 ## MJKB v3 streaming format
 
-MJKB v3 is used by the reader/writer streaming APIs. The legacy MajikFile::create and byte-buffer APIs remain on v2 for compatibility.
+MJKB v3 is the default for new files, including the convenience MajikFile::create API. Use MajikFile::create_v2 only when a consumer still requires v2. The reader/writer API is the bounded-memory path for very large files; create() still starts with an in-memory Vec and keeps the resulting container in memory.
 
 The 21-byte prefix is unchanged: magic, version, 12-byte nonce base, and big-endian payload length, followed by the v3 JSON payload. The encrypted stream then contains:
 
