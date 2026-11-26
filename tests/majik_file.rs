@@ -238,7 +238,7 @@ fn create_defaults_to_v3_and_keeps_v2_available_explicitly() {
         AnyMjkbPayload::V3(MjkbPayloadV3::Single(payload)) => {
             assert_eq!(payload.stream_suite, "AES-256-GCM-CHUNKED-1");
             assert_eq!(payload.chunk_size as usize, DEFAULT_STREAM_CHUNK_SIZE);
-            assert_eq!(payload.z, true);
+            assert!(payload.z);
             assert!(payload.ca.is_none());
         }
         _ => panic!("MajikFile::create must write an MJKB v3 single-recipient payload"),
