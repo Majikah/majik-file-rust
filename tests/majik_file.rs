@@ -311,6 +311,20 @@ fn tampered_ciphertext_fails_to_decrypt() {
     );
 }
 
+
+#[test]
+fn v3_binary_with_mjks_trailer_remains_decryptable() {
+    let id = test_identity("signed-v3");
+    let file = MajikFile::create(opts(TEXT, &id)).unwrap();
+    let mut signed = file.to_mjkb().unwrap().to_vec();
+    signed.extend_from_slice(b"{}");
+    signed.extend_from_slice(&2u32.to_be_bytes());
+    signed.extend_from_slice(b"MJKS");
+
+    assert!(MajikFile::has_mjks_trailer(&signed));
+    assert_eq!(MajikFile::decrypt(&signed, &id, None).unwrap(), TEXT);
+}
+
 #[test]
 fn legacy_v1_binary_is_still_decryptable() {
     // Hand-build a v1 binary: payload has `c` and no `z`; decompression is
