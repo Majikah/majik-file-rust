@@ -17,7 +17,7 @@ It creates self-contained `.mjkb` files using **ML-KEM-768 (FIPS 203) + AES-256-
 - Existing **MJKB v1** and **MJKB v2** files remain readable. Decryption detects the version from the binary header.
 - The JSON record schema is independent of the binary version. Current records use `schema_version: 1`; an absent schema-version field is interpreted as legacy schema `0`.
 - Legacy JSON records may omit `kem_alg` and `cipher_alg`. All pre-existing records used `ML-KEM-768` and `AES-256-GCM`, so Rust deserialization restores these historical defaults before file or nested stamp-row hydration.
-- The binary is authoritative for the IV and compression flag/algorithm. The JSON record contains metadata, not the encrypted binary.
+- The binary is authoritative for the format version, IV, compression flag/algorithm and streaming parameters. The JSON record contains metadata, not the encrypted binary.
 - TypeScript `MajikFile.toJSON()` omits `compression_alg`. Rust follows that serializer behavior; a custom codec identifier remains in the v2 binary payload's `ca` field.
 
 The MJKB format version and JSON record schema version are separate axes. A v2 binary may be stored alongside a legacy schema-v0 JSON record.
@@ -28,7 +28,7 @@ The MJKB format version and JSON record schema version are separate axes. A v2 b
 2. Optionally preprocess through `MajikFileHooks`, then apply MIME-based Zstandard compression.
 3. For a single recipient, use the ML-KEM shared secret directly as the AES-256-GCM key.
 4. For group files, encrypt once with a random AES-256 key and wrap that key for each recipient using ML-KEM shared secrets.
-5. Write the IV, payload JSON, and authenticated ciphertext into the `.mjkb` container.
+5. Write the payload and authenticated ciphertext into the `.mjkb` container. V3 emits independently authenticated chunks and a final manifest.
 
 The owner is always included as the first recipient. Duplicate recipient fingerprints and the owner's own fingerprint are removed while preserving first-occurrence order. The maximum is **32 additional recipients**, excluding the owner.
 
@@ -39,13 +39,13 @@ The fixed header is 21 bytes:
 | Offset | Length | Field |
 | ---: | ---: | --- |
 | 0 | 4 | ASCII magic `MJKB` |
-| 4 | 1 | Format version (`0x02` current; `0x01` legacy) |
+| 4 | 1 | Format version (`0x03` current; `0x02` previous; `0x01` legacy) |
 | 5 | 12 | AES-GCM IV |
 | 17 | 4 | Payload JSON byte length, big-endian uint32 |
 | 21 | N | UTF-8 payload JSON |
 | 21 + N | M | AES-GCM ciphertext, including the 16-byte authentication tag |
 
-**Current v2 single-recipient payload:**
+**Previous v2 single-recipient payload (legacy):**
 
 ~~~json
 {
@@ -56,7 +56,7 @@ The fixed header is 21 bytes:
 }
 ~~~
 
-**Current v2 group payload:**
+**Previous v2 group payload (legacy):**
 
 ~~~json
 {
