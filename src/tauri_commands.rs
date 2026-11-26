@@ -140,6 +140,9 @@ pub struct EncryptRequest {
     pub compression_level: Option<i32>,
     #[serde(default)]
     pub bypass_size_limit: bool,
+    /// Defaults to MJKB v3. Set to 2 only for legacy consumers.
+    #[serde(default)]
+    pub format_version: Option<u8>,
 }
 
 /// Result returned to TypeScript after a successful `cmd_decrypt_file_with_metadata`.
@@ -207,6 +210,9 @@ pub fn cmd_generate_ml_kem_keypair() -> KeypairResult {
 /// Encrypt a file and return the .mjkb bytes + Supabase metadata.
 #[tauri::command]
 pub fn cmd_encrypt_file(req: EncryptRequest) -> Result<EncryptResult, String> {
+    let format_version = req.format_version.unwrap_or(
+        crate::core::crypto::constants::MJKB_VERSION_STREAMING,
+    );
     let options = MajikFileCreateOptions {
         data: req.data,
         user_id: req.user_id,
@@ -220,7 +226,12 @@ pub fn cmd_encrypt_file(req: EncryptRequest) -> Result<EncryptResult, String> {
         compressor: None,
     };
 
-    let file = MajikFile::create(options).map_err(|e| e.to_string())?;
+    let file = match format_version {
+        crate::core::crypto::constants::MJKB_VERSION_STREAMING => MajikFile::create(options),
+        crate::core::crypto::constants::MJKB_VERSION => MajikFile::create_v2(options),
+        other => return Err(format!("Unsupported requested MJKB format version: {other}")),
+    }
+    .map_err(|e| e.to_string())?;
     let mjkb_bytes = file.to_mjkb().map_err(|e| e.to_string())?.to_vec();
     let json = file.to_json().map_err(|e| e.to_string())?;
     let metadata = serde_json::to_value(&json).map_err(|e| e.to_string())?;
