@@ -896,3 +896,177 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+
+#[cfg(test)]
+mod additional_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    use crate::core::crypto::crypto_provider::generate_ml_kem_keypair;
+    use crate::core::types::{
+        MajikFileDecryptIdentity, MajikFileEncryptionIdentity, MajikFileRecipient,
+    };
+
+    fn identity(label: &str) -> (MajikFileEncryptionIdentity, Vec<u8>, String) {
+        let keypair = generate_ml_kem_keypair();
+        let fingerprint = format!("streaming-{label}");
+        (
+            MajikFileEncryptionIdentity {
+                public_key: format!("public-{label}"),
+                fingerprint: fingerprint.clone(),
+                ml_kem_public_key: keypair.public_key,
+            },
+            keypair.secret_key.to_vec(),
+            fingerprint,
+        )
+    }
+
+    #[test]
+    fn v3_group_roundtrip_works_for_owner_and_recipient() {
+        let (owner, owner_secret, owner_fingerprint) = identity("owner");
+        let (recipient, recipient_secret, recipient_fingerprint) = identity("recipient");
+        let recipient_entry = MajikFileRecipient {
+            public_key: recipient.public_key.clone(),
+            fingerprint: recipient.fingerprint.clone(),
+            ml_kem_public_key: recipient.ml_kem_public_key.clone(),
+        };
+        let input = vec![0x31u8; MIN_STREAM_CHUNK_SIZE + 33];
+
+        let mut source = Cursor::new(input.clone());
+        let mut encrypted = Vec::new();
+        let mut encrypt_options = StreamingOptions::default();
+        encrypt_options.chunk_size = MIN_STREAM_CHUNK_SIZE;
+        encrypt_options.compression = Some(false);
+        let result = encrypt_reader_to_writer(
+            &mut source,
+            &mut encrypted,
+            &owner,
+            &[recipient_entry],
+            Some("group.bin"),
+            Some("application/octet-stream"),
+            &mut encrypt_options,
+        )
+        .expect("group encryption succeeds");
+        assert!(result.is_group);
+
+        for (fingerprint, secret) in [
+            (owner_fingerprint.as_str(), owner_secret.as_slice()),
+            (recipient_fingerprint.as_str(), recipient_secret.as_slice()),
+        ] {
+            let mut encrypted_source = Cursor::new(encrypted.clone());
+            let mut plaintext = Vec::new();
+            let mut decrypt_options = StreamingOptions::default();
+            decrypt_reader_to_writer(
+                &mut encrypted_source,
+                &mut plaintext,
+                MajikFileDecryptIdentity::new(fingerprint, secret),
+                &mut decrypt_options,
+            )
+            .expect("each group recipient can decrypt");
+            assert_eq!(plaintext, input);
+        }
+    }
+
+    #[test]
+    fn v3_rejects_tampered_chunk_ciphertext() {
+        let (identity, secret, fingerprint) = identity("tamper");
+        let input = vec![0x77u8; MIN_STREAM_CHUNK_SIZE + 11];
+        let mut source = Cursor::new(input);
+        let mut encrypted = Vec::new();
+        let mut options = StreamingOptions::default();
+        options.chunk_size = MIN_STREAM_CHUNK_SIZE;
+        options.compression = Some(false);
+        encrypt_reader_to_writer(
+            &mut source,
+            &mut encrypted,
+            &identity,
+            &[],
+            None,
+            Some("application/octet-stream"),
+            &mut options,
+        )
+        .expect("encryption succeeds");
+
+        let payload_len = u32::from_be_bytes(encrypted[17..21].try_into().unwrap()) as usize;
+        let first_chunk_ciphertext = 21 + payload_len + 4;
+        encrypted[first_chunk_ciphertext] ^= 0x80;
+
+        let mut encrypted_source = Cursor::new(encrypted);
+        let mut plaintext = Vec::new();
+        let mut decrypt_options = StreamingOptions::default();
+        assert!(decrypt_reader_to_writer(
+            &mut encrypted_source,
+            &mut plaintext,
+            MajikFileDecryptIdentity::new(&fingerprint, &secret),
+            &mut decrypt_options,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v3_rejects_truncated_final_manifest() {
+        let (identity, secret, fingerprint) = identity("truncated");
+        let input = vec![0x23u8; MIN_STREAM_CHUNK_SIZE + 3];
+        let mut source = Cursor::new(input);
+        let mut encrypted = Vec::new();
+        let mut options = StreamingOptions::default();
+        options.chunk_size = MIN_STREAM_CHUNK_SIZE;
+        options.compression = Some(false);
+        encrypt_reader_to_writer(
+            &mut source,
+            &mut encrypted,
+            &identity,
+            &[],
+            None,
+            Some("application/octet-stream"),
+            &mut options,
+        )
+        .expect("encryption succeeds");
+        encrypted.pop();
+
+        let mut encrypted_source = Cursor::new(encrypted);
+        let mut plaintext = Vec::new();
+        let mut decrypt_options = StreamingOptions::default();
+        assert!(decrypt_reader_to_writer(
+            &mut encrypted_source,
+            &mut plaintext,
+            MajikFileDecryptIdentity::new(&fingerprint, &secret),
+            &mut decrypt_options,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn v3_enforces_decrypted_output_limit() {
+        let (identity, secret, fingerprint) = identity("limit");
+        let input = vec![0x55u8; MIN_STREAM_CHUNK_SIZE + 2];
+        let mut source = Cursor::new(input);
+        let mut encrypted = Vec::new();
+        let mut encrypt_options = StreamingOptions::default();
+        encrypt_options.chunk_size = MIN_STREAM_CHUNK_SIZE;
+        encrypt_options.compression = Some(false);
+        encrypt_reader_to_writer(
+            &mut source,
+            &mut encrypted,
+            &identity,
+            &[],
+            None,
+            Some("application/octet-stream"),
+            &mut encrypt_options,
+        )
+        .expect("encryption succeeds");
+
+        let mut encrypted_source = Cursor::new(encrypted);
+        let mut plaintext = Vec::new();
+        let mut decrypt_options = StreamingOptions::default();
+        decrypt_options.max_bytes = Some(1024);
+        assert!(decrypt_reader_to_writer(
+            &mut encrypted_source,
+            &mut plaintext,
+            MajikFileDecryptIdentity::new(&fingerprint, &secret),
+            &mut decrypt_options,
+        )
+        .is_err());
+    }
+}
