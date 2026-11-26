@@ -4,12 +4,12 @@
 //! It does not decide compression policy (that is `_decryptCore`'s job).
 
 use crate::core::crypto::constants::{
-    AES_KEY_LEN, IV_LENGTH, MJKB_SUPPORTED_VERSIONS, MJKB_VERSION,
+    AES_KEY_LEN, IV_LENGTH, MJKB_SUPPORTED_VERSIONS, MJKB_VERSION, MJKB_VERSION_STREAMING,
 };
 use crate::core::crypto::crypto_provider::ml_kem_decapsulate;
 use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::error::{MajikFileError, Result};
-use crate::core::types::{AnyMjkbPayload, DecodedMjkb, MjkbPayload};
+use crate::core::types::{AnyMjkbPayload, DecodedMjkb, MjkbPayload, MjkbPayloadV3};
 use crate::core::utils::base64_to_array;
 
 pub const MJKB_MAGIC: [u8; 4] = [0x4d, 0x4a, 0x4b, 0x42]; // "MJKB"
@@ -99,10 +99,18 @@ pub fn decode_mjkb(raw: &[u8]) -> Result<DecodedMjkb> {
             MajikFileError::format_error("Malformed .mjkb: declared payload length exceeds buffer")
         })?;
 
-    let payload: AnyMjkbPayload =
-        serde_json::from_slice(&raw[payload_start..ct_start]).map_err(|_| {
+    let payload_bytes = &raw[payload_start..ct_start];
+    let payload: AnyMjkbPayload = if version == MJKB_VERSION_STREAMING {
+        serde_json::from_slice::<MjkbPayloadV3>(payload_bytes)
+            .map(AnyMjkbPayload::V3)
+            .map_err(|_| {
+                MajikFileError::format_error("Malformed .mjkb v3: streaming payload JSON failed to parse")
+            })?
+    } else {
+        serde_json::from_slice(payload_bytes).map_err(|_| {
             MajikFileError::format_error("Malformed .mjkb: payload JSON failed to parse")
-        })?;
+        })?
+    };
 
     let ciphertext = raw[ct_start..].to_vec();
     if ciphertext.is_empty() {
@@ -127,9 +135,11 @@ pub fn resolve_aes_key_from_payload(
     fingerprint: &str,
     ml_kem_secret_key: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
-    use crate::core::types::{MjkbPayloadV1, MjkbPayloadV2};
+    use crate::core::types::{MjkbPayloadV1, MjkbPayloadV2, MjkbPayloadV3};
 
     let (single_ct, group_keys) = match payload {
+        AnyMjkbPayload::V3(MjkbPayloadV3::Single(p)) => (Some(&p.ml_kem_cipher_text), None),
+        AnyMjkbPayload::V3(MjkbPayloadV3::Group(p)) => (None, Some(&p.keys)),
         AnyMjkbPayload::V2(MjkbPayloadV2::Single(p)) => (Some(&p.ml_kem_cipher_text), None),
         AnyMjkbPayload::V1(MjkbPayloadV1::Single(p)) => (Some(&p.ml_kem_cipher_text), None),
         AnyMjkbPayload::V2(MjkbPayloadV2::Group(p)) => (None, Some(&p.keys)),
