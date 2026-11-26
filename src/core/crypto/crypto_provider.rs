@@ -101,9 +101,10 @@ pub fn aes_gcm_encrypt_with_aad(
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| {
         MajikFileError::encryption_failed(Some(Box::new(std::io::Error::other(e.to_string()))))
     })?;
+    let nonce = Nonce::try_from(iv).expect("iv length validated");
     cipher
         .encrypt(
-            Nonce::from_slice(iv),
+            &nonce,
             Payload {
                 msg: plaintext,
                 aad,
@@ -128,9 +129,10 @@ pub fn aes_gcm_decrypt_with_aad(
             Some(Box::new(std::io::Error::other(e.to_string()))),
         )
     })?;
+    let nonce = Nonce::try_from(iv).expect("iv length validated");
     Ok(cipher
         .decrypt(
-            Nonce::from_slice(iv),
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad,
