@@ -280,53 +280,137 @@ pub enum MjkbPayloadV2 {
 /// "Current" payload — what `encode_mjkb()` always writes.
 pub type MjkbPayload = MjkbPayloadV2;
 
-/// Any payload `decode_mjkb()` may return (V2 is tried first: it requires `z`).
+/// v3 payloads use the same recipient encapsulation fields as v2 plus the
+/// chunking and authenticated-stream suite parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MjkbSinglePayloadV3 {
+    pub ml_kem_cipher_text: String,
+    pub n: Option<String>,
+    pub m: Option<String>,
+    pub z: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    pub chunk_size: u32,
+    pub stream_suite: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MjkbGroupPayloadV3 {
+    pub keys: Vec<MajikFileGroupKey>,
+    pub n: Option<String>,
+    pub m: Option<String>,
+    pub z: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    pub chunk_size: u32,
+    pub stream_suite: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MjkbPayloadV3 {
+    Group(MjkbGroupPayloadV3),
+    Single(MjkbSinglePayloadV3),
+}
+
+impl MjkbPayloadV3 {
+    pub fn is_group(&self) -> bool {
+        matches!(self, Self::Group(_))
+    }
+    pub fn n(&self) -> Option<&str> {
+        match self {
+            Self::Group(p) => p.n.as_deref(),
+            Self::Single(p) => p.n.as_deref(),
+        }
+    }
+    pub fn m(&self) -> Option<&str> {
+        match self {
+            Self::Group(p) => p.m.as_deref(),
+            Self::Single(p) => p.m.as_deref(),
+        }
+    }
+    pub fn z(&self) -> bool {
+        match self {
+            Self::Group(p) => p.z,
+            Self::Single(p) => p.z,
+        }
+    }
+    pub fn ca(&self) -> Option<&str> {
+        match self {
+            Self::Group(p) => p.ca.as_deref(),
+            Self::Single(p) => p.ca.as_deref(),
+        }
+    }
+    pub fn chunk_size(&self) -> u32 {
+        match self {
+            Self::Group(p) => p.chunk_size,
+            Self::Single(p) => p.chunk_size,
+        }
+    }
+    pub fn stream_suite(&self) -> &str {
+        match self {
+            Self::Group(p) => &p.stream_suite,
+            Self::Single(p) => &p.stream_suite,
+        }
+    }
+}
+
+/// Any payload decode_mjkb() may return. V3 is parsed explicitly by the
+/// binary version, not by serde's untagged fallback, to avoid v2 matching it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AnyMjkbPayload {
+    V3(MjkbPayloadV3),
     V2(MjkbPayloadV2),
     V1(MjkbPayloadV1),
 }
 
 impl AnyMjkbPayload {
     pub fn is_group(&self) -> bool {
-        matches!(
-            self,
-            Self::V2(MjkbPayloadV2::Group(_)) | Self::V1(MjkbPayloadV1::Group(_))
-        )
+        match self {
+            Self::V3(p) => p.is_group(),
+            Self::V2(MjkbPayloadV2::Group(_)) | Self::V1(MjkbPayloadV1::Group(_)) => true,
+            _ => false,
+        }
     }
     pub fn is_single(&self) -> bool {
         !self.is_group()
     }
-    /// Original filename (`n`).
+    /// Original filename (n).
     pub fn n(&self) -> Option<&str> {
         match self {
+            Self::V3(p) => p.n(),
             Self::V2(MjkbPayloadV2::Group(p)) => p.n.as_deref(),
             Self::V2(MjkbPayloadV2::Single(p)) => p.n.as_deref(),
             Self::V1(MjkbPayloadV1::Group(p)) => p.n.as_deref(),
             Self::V1(MjkbPayloadV1::Single(p)) => p.n.as_deref(),
         }
     }
-    /// MIME type (`m`).
+    /// MIME type (m).
     pub fn m(&self) -> Option<&str> {
         match self {
+            Self::V3(p) => p.m(),
             Self::V2(MjkbPayloadV2::Group(p)) => p.m.as_deref(),
             Self::V2(MjkbPayloadV2::Single(p)) => p.m.as_deref(),
             Self::V1(MjkbPayloadV1::Group(p)) => p.m.as_deref(),
             Self::V1(MjkbPayloadV1::Single(p)) => p.m.as_deref(),
         }
     }
-    /// Explicit compression flag; `None` for v1 payloads.
+    /// Explicit compression flag; None for v1 payloads.
     pub fn z(&self) -> Option<bool> {
         match self {
+            Self::V3(p) => Some(p.z()),
             Self::V2(MjkbPayloadV2::Group(p)) => Some(p.z),
             Self::V2(MjkbPayloadV2::Single(p)) => Some(p.z),
             Self::V1(_) => None,
         }
     }
-    /// Compression algorithm tag; `None` means zstd.
+    /// Compression algorithm tag; None means zstd.
     pub fn ca(&self) -> Option<&str> {
         match self {
+            Self::V3(p) => p.ca(),
             Self::V2(MjkbPayloadV2::Group(p)) => p.ca.as_deref(),
             Self::V2(MjkbPayloadV2::Single(p)) => p.ca.as_deref(),
             Self::V1(_) => None,

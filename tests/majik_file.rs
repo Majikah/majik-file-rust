@@ -214,9 +214,9 @@ fn only_owner_in_recipients_stays_single() {
 // ── Binary format ──────────────────────────────────────────────────────────
 
 #[test]
-fn binary_header_layout_is_v2() {
+fn legacy_create_v2_preserves_binary_header_layout() {
     let id = test_identity("a");
-    let f = MajikFile::create(opts(TEXT, &id)).unwrap();
+    let f = MajikFile::create_v2(opts(TEXT, &id)).unwrap();
     let b = f.to_mjkb().unwrap();
     assert_eq!(&b[..4], b"MJKB");
     assert_eq!(b[4], MJKB_VERSION);
@@ -227,9 +227,33 @@ fn binary_header_layout_is_v2() {
 }
 
 #[test]
-fn default_payload_matches_ts_shape() {
+fn create_defaults_to_v3_and_keeps_v2_available_explicitly() {
+    let id = test_identity("default-v3");
+    let file = MajikFile::create(opts(TEXT, &id)).unwrap();
+    let binary = file.to_mjkb().unwrap();
+    assert_eq!(binary[4], MJKB_VERSION_STREAMING);
+
+    let decoded = decode_mjkb(binary).unwrap();
+    match decoded.payload {
+        AnyMjkbPayload::V3(MjkbPayloadV3::Single(payload)) => {
+            assert_eq!(payload.stream_suite, "AES-256-GCM-CHUNKED-1");
+            assert_eq!(payload.chunk_size as usize, DEFAULT_STREAM_CHUNK_SIZE);
+            assert!(payload.z);
+            assert!(payload.ca.is_none());
+        }
+        _ => panic!("MajikFile::create must write an MJKB v3 single-recipient payload"),
+    }
+    assert_eq!(file.decrypt_binary(&id, None).unwrap(), TEXT);
+
+    let legacy = MajikFile::create_v2(opts(TEXT, &id)).unwrap();
+    assert_eq!(legacy.to_mjkb().unwrap()[4], MJKB_VERSION);
+    assert_eq!(legacy.decrypt_binary(&id, None).unwrap(), TEXT);
+}
+
+#[test]
+fn legacy_v2_payload_matches_ts_shape() {
     let id = test_identity("a");
-    let f = MajikFile::create(opts(TEXT, &id)).unwrap();
+    let f = MajikFile::create_v2(opts(TEXT, &id)).unwrap();
     let d = decode_mjkb(f.to_mjkb().unwrap()).unwrap();
     let len = u32::from_be_bytes(f.to_mjkb().unwrap()[17..21].try_into().unwrap()) as usize;
     let json: serde_json::Value =
@@ -285,6 +309,19 @@ fn tampered_ciphertext_fails_to_decrypt() {
         code(MajikFile::decrypt(&b, &id, None).unwrap_err()),
         MajikFileErrorCode::DecryptionFailed
     );
+}
+
+#[test]
+fn v3_binary_with_mjks_trailer_remains_decryptable() {
+    let id = test_identity("signed-v3");
+    let file = MajikFile::create(opts(TEXT, &id)).unwrap();
+    let mut signed = file.to_mjkb().unwrap().to_vec();
+    signed.extend_from_slice(b"{}");
+    signed.extend_from_slice(&2u32.to_be_bytes());
+    signed.extend_from_slice(b"MJKS");
+
+    assert!(MajikFile::has_mjks_trailer(&signed));
+    assert_eq!(MajikFile::decrypt(&signed, &id, None).unwrap(), TEXT);
 }
 
 #[test]

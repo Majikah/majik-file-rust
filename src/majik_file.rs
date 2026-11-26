@@ -14,14 +14,15 @@
 //! the [`SignatureProvider`] trait; the file only stores the serialized
 //! signature string.
 //!
-//! ## .mjkb v2
-//! `[4 "MJKB"][1 ver][12 IV][4 len BE][payload JSON][AES-GCM ciphertext]`
-//! with the explicit `z` compression flag and optional `ca` algorithm tag.
+//! ## .mjkb formats
+//! v1/v2 use a single AES-GCM ciphertext; v3 uses independently authenticated
+//! chunks and a final authenticated manifest. `MajikFile::create` writes v3.
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::io::Cursor;
 
-use chrono::{SecondsFormat, Utc};
+use jiff::Timestamp;
 
 use crate::core::compressor::majik_compressor::{CompressionLevel, MajikCompressor, ZSTD_CODEC};
 use crate::core::crypto::constants::*;
@@ -31,9 +32,11 @@ use crate::core::crypto::crypto_provider::{
 use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::error::{MajikFileError, Result};
 use crate::core::mjkb_codec::{decode_mjkb, encode_mjkb, resolve_aes_key_from_payload, MJKB_MAGIC};
+use crate::core::streaming::{decrypt_reader_to_writer, StreamingOptions};
 use crate::core::types::*;
 use crate::core::utils::*;
 use crate::core::validator::MajikFileValidator;
+use crate::encrypt_reader_to_writer;
 
 /// MIME type used when exporting .mjkb bytes.
 pub const MJKB_MIME_TYPE: &str = "application/vnd.majikah.bundle";
@@ -136,7 +139,9 @@ pub struct CanDecryptMjkbOptions {
 }
 
 fn now_iso() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 fn blank(s: &Option<String>) -> bool {
@@ -485,7 +490,84 @@ impl MajikFile {
 
     // ── Create ─────────────────────────────────────────────────────────────
 
+    /// Create a new MJKB v3 file by default.
+    ///
+    /// This convenience API accepts in-memory bytes and therefore retains the
+    /// input and resulting container in memory. For very large files, use
+    /// encrypt_reader_to_writer or the Tauri path-based streaming command.
+    ///
+    /// Custom legacy compression codecs remain available through create_v2;
+    /// MJKB v3 currently standardizes streaming compression on Zstandard.
     pub fn create(options: MajikFileCreateOptions) -> Result<MajikFile> {
+        // Preserve historical custom-codec behavior until the v3 wire format
+        // defines an interoperable streaming contract for arbitrary codecs.
+        if options.compressor.is_some() {
+            return Self::create_v2(options);
+        }
+
+        MajikFileValidator::assert_user_id(Some(&options.user_id))?;
+        let input_size = options.data.len();
+        MajikFileValidator::assert_non_empty_data(input_size)?;
+        MajikFileValidator::assert_size_within_limit(
+            input_size,
+            MAX_FILE_SIZE_BYTES,
+            options.bypass_size_limit,
+        )?;
+
+        let mime_type = options.mime_type.clone().or_else(|| {
+            options
+                .original_name
+                .as_deref()
+                .and_then(infer_mime_type_from_filename)
+        });
+
+        let mut reader = Cursor::new(options.data);
+        let mut binary = Vec::new();
+        let mut stream_options = StreamingOptions {
+            compression_level: options.compression_level,
+            total_bytes: Some(input_size as u64),
+            ..StreamingOptions::default()
+        };
+        let streamed = encrypt_reader_to_writer(
+            &mut reader,
+            &mut binary,
+            &options.identity,
+            &options.recipients,
+            options.original_name.as_deref(),
+            mime_type.as_deref(),
+            &mut stream_options,
+        )?;
+
+        let now = now_iso();
+        let json = MajikFileJson {
+            id: options.id.unwrap_or_else(generate_uuid),
+            schema_version: FILE_SCHEMA_VERSION,
+            kind: FILE_KIND.to_string(),
+            user_id: options.user_id,
+            original_name: options.original_name,
+            mime_type,
+            size_original: streamed.original_bytes,
+            size_stored: binary.len() as u64,
+            file_hash: streamed.file_hash,
+            encryption_iv: streamed.encryption_iv,
+            participants: streamed.participants,
+            kem_alg: CRYPTO_SUITE.kem_alg.to_string(),
+            cipher_alg: CRYPTO_SUITE.cipher_alg.to_string(),
+            compression_level: options.compression_level,
+            // Built-in Zstandard remains the implicit/default codec, matching v2 JSON semantics.
+            compression_alg: None,
+            timestamp: Some(now.clone()),
+            last_update: Some(now),
+            signature: None,
+        };
+        Self::from_parts(json, Some(binary), streamed.is_group)
+    }
+
+    /// Explicitly create a legacy-compatible MJKB v2 file.
+    ///
+    /// Use this only when a downstream consumer has not yet implemented v3.
+    /// The standard create() API writes v3.
+    pub fn create_v2(options: MajikFileCreateOptions) -> Result<MajikFile> {
         MajikFileValidator::assert_user_id(Some(&options.user_id))?;
 
         let mime_type = options.mime_type.clone().or_else(|| {
@@ -576,6 +658,22 @@ impl MajikFile {
         )?;
 
         let raw = Self::strip_mjks_trailer(source);
+
+        // V3 uses independently authenticated chunk records. Keep the v1/v2
+        // one-shot path below byte-for-byte unchanged.
+        if raw.get(4) == Some(&MJKB_VERSION_STREAMING) {
+            let mut cursor = Cursor::new(raw);
+            let mut plaintext = Vec::new();
+            let mut streaming_options = StreamingOptions::default();
+            let streamed = decrypt_reader_to_writer(
+                &mut cursor,
+                &mut plaintext,
+                *identity,
+                &mut streaming_options,
+            )?;
+            return Ok((plaintext, AnyMjkbPayload::V3(streamed.payload)));
+        }
+
         let decoded = decode_mjkb(raw)?;
 
         let aes_key = resolve_aes_key_from_payload(
@@ -1008,7 +1106,8 @@ impl MajikFile {
 
     /// Structural validation beyond the magic-byte check. Does NOT decrypt.
     pub fn is_valid_mjkb(data: &[u8]) -> bool {
-        if data.len() < 23 || data[..4] != MJKB_MAGIC {
+        if data.len() < 23 || data[..4] != MJKB_MAGIC || !MJKB_SUPPORTED_VERSIONS.contains(&data[4])
+        {
             return false;
         }
         let o = 17; // 4 magic + 1 version + 12 IV
@@ -1184,8 +1283,11 @@ impl MajikFile {
     }
 
     fn group_has_fingerprint(payload: &AnyMjkbPayload, fingerprint: &str) -> bool {
-        use crate::core::types::{MjkbPayloadV1, MjkbPayloadV2};
+        use crate::core::types::{MjkbPayloadV1, MjkbPayloadV2, MjkbPayloadV3};
         match payload {
+            AnyMjkbPayload::V3(MjkbPayloadV3::Group(p)) => {
+                p.keys.iter().any(|k| k.fingerprint == fingerprint)
+            }
             AnyMjkbPayload::V2(MjkbPayloadV2::Group(p)) => {
                 p.keys.iter().any(|k| k.fingerprint == fingerprint)
             }

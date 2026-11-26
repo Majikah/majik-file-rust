@@ -11,11 +11,13 @@ It creates self-contained `.mjkb` files using **ML-KEM-768 (FIPS 203) + AES-256-
 
 ## Compatibility contract
 
-- New files use **MJKB v2** (format byte `0x02`).
-- Existing **MJKB v1** files (format byte `0x01`) remain readable.
+- New encryption through `MajikFile::create` writes **MJKB v3** (format byte `0x03`).
+- New reader/writer streaming APIs also write **MJKB v3**.
+- `MajikFile::create_v2` is available as an explicit compatibility option for older consumers; custom legacy compression codecs currently use this v2 path.
+- Existing **MJKB v1** and **MJKB v2** files remain readable. Decryption detects the version from the binary header.
 - The JSON record schema is independent of the binary version. Current records use `schema_version: 1`; an absent schema-version field is interpreted as legacy schema `0`.
 - Legacy JSON records may omit `kem_alg` and `cipher_alg`. All pre-existing records used `ML-KEM-768` and `AES-256-GCM`, so Rust deserialization restores these historical defaults before file or nested stamp-row hydration.
-- The binary is authoritative for the IV and compression flag/algorithm. The JSON record contains metadata, not the encrypted binary.
+- The binary is authoritative for the format version, IV, compression flag/algorithm and streaming parameters. The JSON record contains metadata, not the encrypted binary.
 - TypeScript `MajikFile.toJSON()` omits `compression_alg`. Rust follows that serializer behavior; a custom codec identifier remains in the v2 binary payload's `ca` field.
 
 The MJKB format version and JSON record schema version are separate axes. A v2 binary may be stored alongside a legacy schema-v0 JSON record.
@@ -26,7 +28,7 @@ The MJKB format version and JSON record schema version are separate axes. A v2 b
 2. Optionally preprocess through `MajikFileHooks`, then apply MIME-based Zstandard compression.
 3. For a single recipient, use the ML-KEM shared secret directly as the AES-256-GCM key.
 4. For group files, encrypt once with a random AES-256 key and wrap that key for each recipient using ML-KEM shared secrets.
-5. Write the IV, payload JSON, and authenticated ciphertext into the `.mjkb` container.
+5. Write the payload and authenticated ciphertext into the `.mjkb` container. V3 emits independently authenticated chunks and a final manifest.
 
 The owner is always included as the first recipient. Duplicate recipient fingerprints and the owner's own fingerprint are removed while preserving first-occurrence order. The maximum is **32 additional recipients**, excluding the owner.
 
@@ -37,13 +39,13 @@ The fixed header is 21 bytes:
 | Offset | Length | Field |
 | ---: | ---: | --- |
 | 0 | 4 | ASCII magic `MJKB` |
-| 4 | 1 | Format version (`0x02` current; `0x01` legacy) |
+| 4 | 1 | Format version (`0x03` current; `0x02` previous; `0x01` legacy) |
 | 5 | 12 | AES-GCM IV |
 | 17 | 4 | Payload JSON byte length, big-endian uint32 |
 | 21 | N | UTF-8 payload JSON |
 | 21 + N | M | AES-GCM ciphertext, including the 16-byte authentication tag |
 
-**Current v2 single-recipient payload:**
+**Previous v2 single-recipient payload (legacy):**
 
 ~~~json
 {
@@ -54,7 +56,7 @@ The fixed header is 21 bytes:
 }
 ~~~
 
-**Current v2 group payload:**
+**Previous v2 group payload (legacy):**
 
 ~~~json
 {
@@ -71,7 +73,54 @@ The fixed header is 21 bytes:
 }
 ~~~
 
-The optional v2 `ca` field identifies a non-default compression codec. An absent `ca` means `zstd`. Legacy v1 payloads used `c` instead of `z`; for those files, decompression is inferred from MIME type.
+The optional v2 `ca` field identifies a non-default compression codec. An absent `ca` means `zstd`. V3 standardizes its streaming compression suite on Zstandard. Legacy v1 payloads used `c` instead of `z`; for those files, decompression is inferred from MIME type.
+
+## MJKB v3 streaming format
+
+MJKB v3 is the default for new files, including the convenience MajikFile::create API. Use MajikFile::create_v2 only when a consumer still requires v2. The reader/writer API is the bounded-memory path for very large files; create() still starts with an in-memory Vec and keeps the resulting container in memory.
+
+The 21-byte prefix is unchanged: magic, version, 12-byte nonce base, and big-endian payload length, followed by the v3 JSON payload. The encrypted stream then contains:
+
+1. Repeated records: a big-endian u32 ciphertext length followed by one AES-256-GCM ciphertext and its 16-byte tag.
+2. Each chunk uses a distinct nonce derived from the random 96-bit nonce base and monotonically increasing 64-bit chunk index.
+3. Chunk AAD binds the payload hash, chunk index, and plaintext chunk length.
+4. A zero-length record marks the end of chunks, followed by an authenticated manifest containing chunk count, compressed-stream length, original plaintext length, and original SHA-256 digest.
+5. A final AES-256-GCM authentication tag authenticates the manifest using the next nonce counter value.
+
+The manifest is mandatory. Missing chunks, reordered/duplicated records, altered chunk lengths, truncation, a modified manifest, and trailing bytes are rejected. Output should be written to a temporary destination and published only after decryption completes and the manifest and plaintext digest validate. The Tauri streaming commands follow this pattern.
+
+The default chunk size is 1 MiB (configurable from 64 KiB through 8 MiB). V3 uses streaming Zstandard when compression is enabled. The Zstandard decoder window memory is separate from the chunk buffer and remains governed by its decoder settings.
+
+### Reader/writer API
+
+~~~rust
+use std::io::{BufReader, BufWriter};
+use majik_file::{
+    encrypt_reader_to_writer, decrypt_reader_to_writer,
+    MajikFileEncryptionIdentity, MajikFileDecryptIdentity, StreamingOptions,
+};
+
+let mut input = BufReader::new(std::fs::File::open("input.bin")?);
+let mut encrypted = BufWriter::new(std::fs::File::create("output.mjkb")?);
+let mut options = StreamingOptions::default();
+
+let result = encrypt_reader_to_writer(
+    &mut input,
+    &mut encrypted,
+    &encryption_identity,
+    &[],
+    Some("input.bin"),
+    Some("application/octet-stream"),
+    &mut options,
+)?;
+encrypted.flush()?;
+~~~
+
+For decryption, use decrypt_reader_to_writer with the recipient fingerprint and ML-KEM secret key. Its reader must contain an MJKB v3 stream. The existing MajikFile::decrypt and Tauri byte-buffer commands continue to support v1/v2 files; those legacy formats are not automatically converted.
+
+### Tauri path commands
+
+When the tauri feature is enabled, cmd_encrypt_file_streaming and cmd_decrypt_file_streaming accept input/output filesystem paths. They do not transfer whole-file byte arrays through IPC, and they write to a sibling temporary file before renaming the completed output.
 
 ## Compression
 

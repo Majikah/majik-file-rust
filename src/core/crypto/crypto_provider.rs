@@ -4,7 +4,7 @@
 //! (2400-byte expanded secret key) · crypto.getRandomValues → OsRng.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
 };
 #[allow(deprecated)]
@@ -14,7 +14,6 @@ use ml_kem::{
     kem::{Decapsulate, Encapsulate, Kem, KeyExport},
     Ciphertext, DecapsulationKey, EncapsulationKey, MlKem768,
 };
-use rand_core::{OsRng, RngCore};
 
 use crate::core::crypto::constants::{
     AES_KEY_LEN, IV_LENGTH, ML_KEM_CT_LEN, ML_KEM_PK_LEN, ML_KEM_SK_LEN,
@@ -48,7 +47,8 @@ pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>> {
         ));
     }
     let mut buf = vec![0u8; len];
-    OsRng.fill_bytes(&mut buf);
+    getrandom::fill(&mut buf)
+        .map_err(|error| MajikFileError::encryption_failed(Some(Box::new(error))))?;
     Ok(buf)
 }
 
@@ -88,6 +88,57 @@ pub fn aes_gcm_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Optio
     let iv = Nonce::try_from(iv).expect("iv length validated");
     let cipher = Aes256Gcm::new(&key);
     Ok(cipher.decrypt(&iv, ciphertext).ok())
+}
+
+/// AES-256-GCM with caller-supplied associated data for MJKB v3 chunks.
+pub fn aes_gcm_encrypt_with_aad(
+    key: &[u8],
+    iv: &[u8],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    check_key_iv("aes_gcm_encrypt_with_aad", key, iv)?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| {
+        MajikFileError::encryption_failed(Some(Box::new(std::io::Error::other(e.to_string()))))
+    })?;
+    let nonce = Nonce::try_from(iv).expect("iv length validated");
+    cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| {
+            MajikFileError::encryption_failed(Some(Box::new(std::io::Error::other(e.to_string()))))
+        })
+}
+
+/// Ok(None) means the chunk or associated data failed authentication.
+pub fn aes_gcm_decrypt_with_aad(
+    key: &[u8],
+    iv: &[u8],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    check_key_iv("aes_gcm_decrypt_with_aad", key, iv)?;
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| {
+        MajikFileError::decryption_failed(
+            "Invalid AES-256-GCM key",
+            Some(Box::new(std::io::Error::other(e.to_string()))),
+        )
+    })?;
+    let nonce = Nonce::try_from(iv).expect("iv length validated");
+    Ok(cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .ok())
 }
 
 // ─── ML-KEM-768 ─────────────────────────────────────────────────────────────
