@@ -62,7 +62,7 @@ pub struct StreamingOptions<'a> {
     pub on_progress: Option<&'a mut dyn FnMut(StreamingProgress)>,
 }
 
-impl Default for StreamingOptions<'_> {
+impl<'a> Default for StreamingOptions<'a> {
     fn default() -> Self {
         Self {
             chunk_size: DEFAULT_STREAM_CHUNK_SIZE,
@@ -291,9 +291,25 @@ pub fn decrypt_reader_to_writer<R: Read, W: Write>(
     let mut hashing_writer = HashingWriter::new(writer, options);
 
     if payload.z() {
-        let mut decoder = StreamingDecoder::new(&mut chunk_reader);
-        io::copy(&mut decoder, &mut hashing_writer)
-            .map_err(|error| MajikFileError::decompression_failed(Some(Box::new(error))))?;
+        {
+            let mut decoder = StreamingDecoder::new(&mut chunk_reader);
+            io::copy(&mut decoder, &mut hashing_writer)
+                .map_err(|error| MajikFileError::decompression_failed(Some(Box::new(error))))?;
+        }
+        // A valid Zstandard frame must consume the entire compressed stream.
+        // Force the chunk reader to its authenticated manifest and reject any
+        // extra decrypted bytes after the frame.
+        let mut trailing = [0u8; 1];
+        if chunk_reader.read(&mut trailing).map_err(|error| {
+            MajikFileError::decryption_failed(
+                "Failed to authenticate the MJKB v3 stream trailer",
+                Some(Box::new(error)),
+            )
+        })? != 0 {
+            return Err(MajikFileError::format_error(
+                "Unexpected compressed data after the Zstandard frame",
+            ));
+        }
     } else {
         io::copy(&mut chunk_reader, &mut hashing_writer)
             .map_err(|error| MajikFileError::decryption_failed(
@@ -717,6 +733,14 @@ impl<'w, 'o, W: Write> HashingWriter<'w, 'o, W> {
     }
 
     fn finish(self) -> Result<(u64, [u8; 32])> {
+        if let Some(expected) = self.options.total_bytes {
+            if expected != self.bytes {
+                return Err(MajikFileError::invalid_input(format!(
+                    "Output stream length mismatch: expected {expected} bytes, wrote {}",
+                    self.bytes
+                )));
+            }
+        }
         Ok((self.bytes, self.hasher.finalize().into()))
     }
 }
