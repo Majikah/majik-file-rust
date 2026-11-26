@@ -26,7 +26,7 @@ aes-gcm = { version = "0.11.1", features = ["zeroize"] }
 # 2400-byte expanded secret-key encoding shared with the TypeScript SDK.
 ml-kem = { version = "0.3.4", features = ["getrandom"] }
 rand_core = "0.10.1"
-getrandom = { version = "0.4.3", features = ["sys_rng"] }
+getrandom = "0.4.3"
 # SHA-256 — replaces @stablelib/sha256
 sha2 = "0.11.2"
 # Pure-Rust zstd (all 22 levels) — replaces @bokuweb/zstd-wasm
