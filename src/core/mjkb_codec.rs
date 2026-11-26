@@ -104,7 +104,9 @@ pub fn decode_mjkb(raw: &[u8]) -> Result<DecodedMjkb> {
         serde_json::from_slice::<MjkbPayloadV3>(payload_bytes)
             .map(AnyMjkbPayload::V3)
             .map_err(|_| {
-                MajikFileError::format_error("Malformed .mjkb v3: streaming payload JSON failed to parse")
+                MajikFileError::format_error(
+                    "Malformed .mjkb v3: streaming payload JSON failed to parse",
+                )
             })?
     } else {
         serde_json::from_slice(payload_bytes).map_err(|_| {

@@ -22,11 +22,8 @@ pub const MJKB_VERSION: u8 = 0x02;
 pub const MJKB_VERSION_LEGACY: u8 = 0x01;
 /// v3 streaming format: independently authenticated chunks and a final manifest.
 pub const MJKB_VERSION_STREAMING: u8 = 0x03;
-pub const MJKB_SUPPORTED_VERSIONS: [u8; 3] = [
-    MJKB_VERSION_LEGACY,
-    MJKB_VERSION,
-    MJKB_VERSION_STREAMING,
-];
+pub const MJKB_SUPPORTED_VERSIONS: [u8; 3] =
+    [MJKB_VERSION_LEGACY, MJKB_VERSION, MJKB_VERSION_STREAMING];
 
 // ─── MJKS signed trailer: [.mjkb][sig JSON][u32 BE len]["MJKS"] ─────────────
 pub const MJKS_MAGIC: [u8; 4] = [0x4d, 0x4a, 0x4b, 0x53];

@@ -311,7 +311,6 @@ fn tampered_ciphertext_fails_to_decrypt() {
     );
 }
 
-
 #[test]
 fn v3_binary_with_mjks_trailer_remains_decryptable() {
     let id = test_identity("signed-v3");

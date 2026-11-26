@@ -32,10 +32,11 @@ use crate::core::crypto::crypto_provider::{
 use crate::core::crypto::zeroize::Zeroizing;
 use crate::core::error::{MajikFileError, Result};
 use crate::core::mjkb_codec::{decode_mjkb, encode_mjkb, resolve_aes_key_from_payload, MJKB_MAGIC};
+use crate::core::streaming::{decrypt_reader_to_writer, StreamingOptions};
 use crate::core::types::*;
 use crate::core::utils::*;
 use crate::core::validator::MajikFileValidator;
-use crate::core::streaming::{decrypt_reader_to_writer, StreamingOptions};
+use crate::encrypt_reader_to_writer;
 
 /// MIME type used when exporting .mjkb bytes.
 pub const MJKB_MIME_TYPE: &str = "application/vnd.majikah.bundle";
@@ -138,7 +139,9 @@ pub struct CanDecryptMjkbOptions {
 }
 
 fn now_iso() -> String {
-    Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 fn blank(s: &Option<String>) -> bool {
@@ -612,7 +615,6 @@ impl MajikFile {
         };
         Self::from_parts(json, Some(core.binary), core.is_group)
     }
-
 
     pub fn create_and_sign<P: SignatureProvider>(
         options: MajikFileCreateOptions,
@@ -1104,9 +1106,7 @@ impl MajikFile {
 
     /// Structural validation beyond the magic-byte check. Does NOT decrypt.
     pub fn is_valid_mjkb(data: &[u8]) -> bool {
-        if data.len() < 23
-            || data[..4] != MJKB_MAGIC
-            || !MJKB_SUPPORTED_VERSIONS.contains(&data[4])
+        if data.len() < 23 || data[..4] != MJKB_MAGIC || !MJKB_SUPPORTED_VERSIONS.contains(&data[4])
         {
             return false;
         }

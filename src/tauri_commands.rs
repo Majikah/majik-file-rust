@@ -58,7 +58,9 @@ use crate::core::types::{
     MajikFileCreateOptions, MajikFileDecryptIdentity, MajikFileEncryptionIdentity,
     MajikFileRecipient,
 };
-use crate::core::utils::{format_bytes, generate_uuid, infer_mime_type_from_filename, sha256_base64, sha256_hex};
+use crate::core::utils::{
+    format_bytes, generate_uuid, infer_mime_type_from_filename, sha256_base64, sha256_hex,
+};
 use crate::majik_file::MajikFile;
 
 // ─── Serialisable DTOs ────────────────────────────────────────────────────────
@@ -175,7 +177,9 @@ fn mjkb_content_len<R: Read + Seek>(reader: &mut R, file_len: u64) -> Result<u64
         .seek(SeekFrom::End(-8))
         .map_err(|error| error.to_string())?;
     let mut footer = [0u8; 8];
-    reader.read_exact(&mut footer).map_err(|error| error.to_string())?;
+    reader
+        .read_exact(&mut footer)
+        .map_err(|error| error.to_string())?;
     if &footer[4..8] != b"MJKS" {
         return Ok(file_len);
     }
@@ -210,9 +214,9 @@ pub fn cmd_generate_ml_kem_keypair() -> KeypairResult {
 /// Encrypt a file and return the .mjkb bytes + Supabase metadata.
 #[tauri::command]
 pub fn cmd_encrypt_file(req: EncryptRequest) -> Result<EncryptResult, String> {
-    let format_version = req.format_version.unwrap_or(
-        crate::core::crypto::constants::MJKB_VERSION_STREAMING,
-    );
+    let format_version = req
+        .format_version
+        .unwrap_or(crate::core::crypto::constants::MJKB_VERSION_STREAMING);
     let options = MajikFileCreateOptions {
         data: req.data,
         user_id: req.user_id,
@@ -229,7 +233,11 @@ pub fn cmd_encrypt_file(req: EncryptRequest) -> Result<EncryptResult, String> {
     let file = match format_version {
         crate::core::crypto::constants::MJKB_VERSION_STREAMING => MajikFile::create(options),
         crate::core::crypto::constants::MJKB_VERSION => MajikFile::create_v2(options),
-        other => return Err(format!("Unsupported requested MJKB format version: {other}")),
+        other => {
+            return Err(format!(
+                "Unsupported requested MJKB format version: {other}"
+            ))
+        }
     }
     .map_err(|e| e.to_string())?;
     let mjkb_bytes = file.to_mjkb().map_err(|e| e.to_string())?.to_vec();
@@ -303,7 +311,6 @@ pub fn cmd_infer_mime_type(filename: String) -> Option<String> {
     infer_mime_type_from_filename(&filename).map(|s| s.to_string())
 }
 
-
 /// File-path streaming encryption request. File bytes stay in native Rust and
 /// are never copied through Tauri IPC as a Vec<u8>.
 #[derive(Debug, Deserialize)]
@@ -372,9 +379,9 @@ pub async fn cmd_encrypt_file_streaming(
                 .map_err(|error| error.to_string())?;
             let mut writer = BufWriter::new(output);
             let mut options = StreamingOptions {
-                chunk_size: req.chunk_size.unwrap_or(
-                    crate::core::streaming::DEFAULT_STREAM_CHUNK_SIZE,
-                ),
+                chunk_size: req
+                    .chunk_size
+                    .unwrap_or(crate::core::streaming::DEFAULT_STREAM_CHUNK_SIZE),
                 compression: req.compression,
                 compression_level: req.compression_level,
                 total_bytes: Some(total_bytes),
@@ -388,21 +395,28 @@ pub async fn cmd_encrypt_file_streaming(
                     .and_then(infer_mime_type_from_filename)
             });
             let identity: MajikFileEncryptionIdentity = req.identity.into();
-            let recipients = req.recipients.into_iter().map(Into::into).collect::<Vec<_>>();
+            let recipients = req
+                .recipients
+                .into_iter()
+                .map(Into::into)
+                .collect::<Vec<_>>();
             let encrypted = encrypt_reader_to_writer(
                 &mut reader,
                 &mut writer,
                 &identity,
                 &recipients,
-                req.original_name.as_deref().or_else(|| {
-                    req.input_path.file_name().and_then(|name| name.to_str())
-                }),
+                req.original_name
+                    .as_deref()
+                    .or_else(|| req.input_path.file_name().and_then(|name| name.to_str())),
                 mime_type.as_deref(),
                 &mut options,
             )
             .map_err(|error| error.to_string())?;
             writer.flush().map_err(|error| error.to_string())?;
-            writer.get_ref().sync_all().map_err(|error| error.to_string())?;
+            writer
+                .get_ref()
+                .sync_all()
+                .map_err(|error| error.to_string())?;
             drop(writer);
             fs::rename(&temp_path, &req.output_path).map_err(|error| error.to_string())?;
             Ok(encrypted)
@@ -432,14 +446,16 @@ pub async fn cmd_decrypt_file_streaming(
         let file_len = input.metadata().map_err(|error| error.to_string())?.len();
         let mut reader = BufReader::new(input);
         let mut prefix = [0u8; 5];
-        reader.read_exact(&mut prefix).map_err(|error| {
-            format!("Unable to read MJKB header: {error}")
-        })?;
+        reader
+            .read_exact(&mut prefix)
+            .map_err(|error| format!("Unable to read MJKB header: {error}"))?;
         if &prefix[..4] != b"MJKB" {
             return Err("Input does not have MJKB magic bytes".to_string());
         }
         let format_version = prefix[4];
-        reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| error.to_string())?;
 
         let temp_path = streaming_temp_path(&req.output_path)?;
         let result = (|| {
@@ -450,15 +466,14 @@ pub async fn cmd_decrypt_file_streaming(
                 .map_err(|error| error.to_string())?;
             let mut writer = BufWriter::new(output);
             let secret = Zeroizing::new(req.ml_kem_secret_key);
-            let identity = MajikFileDecryptIdentity::new(
-                &req.fingerprint,
-                secret.as_slice(),
-            );
+            let identity = MajikFileDecryptIdentity::new(&req.fingerprint, secret.as_slice());
 
             let decrypted_result = match format_version {
                 crate::core::crypto::constants::MJKB_VERSION_STREAMING => {
                     let body_len = mjkb_content_len(&mut reader, file_len)?;
-                    reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+                    reader
+                        .seek(SeekFrom::Start(0))
+                        .map_err(|error| error.to_string())?;
                     let mut limited_reader = reader.take(body_len);
                     let mut options = StreamingOptions {
                         max_bytes: req.max_bytes,
@@ -482,17 +497,20 @@ pub async fn cmd_decrypt_file_streaming(
                 }
                 crate::core::crypto::constants::MJKB_VERSION_LEGACY
                 | crate::core::crypto::constants::MJKB_VERSION => {
-                    reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+                    reader
+                        .seek(SeekFrom::Start(0))
+                        .map_err(|error| error.to_string())?;
                     let mut encrypted = Vec::new();
-                    reader.read_to_end(&mut encrypted).map_err(|error| error.to_string())?;
-                    let decrypted = MajikFile::decrypt_with_metadata_from(
-                        &encrypted,
-                        identity,
-                        None,
-                        None,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    if req.max_bytes.is_some_and(|maximum| decrypted.bytes.len() as u64 > maximum) {
+                    reader
+                        .read_to_end(&mut encrypted)
+                        .map_err(|error| error.to_string())?;
+                    let decrypted =
+                        MajikFile::decrypt_with_metadata_from(&encrypted, identity, None, None)
+                            .map_err(|error| error.to_string())?;
+                    if req
+                        .max_bytes
+                        .is_some_and(|maximum| decrypted.bytes.len() as u64 > maximum)
+                    {
                         return Err("Decrypted output exceeds configured maximum".to_string());
                     }
                     writer
@@ -511,7 +529,10 @@ pub async fn cmd_decrypt_file_streaming(
             };
 
             writer.flush().map_err(|error| error.to_string())?;
-            writer.get_ref().sync_all().map_err(|error| error.to_string())?;
+            writer
+                .get_ref()
+                .sync_all()
+                .map_err(|error| error.to_string())?;
             drop(writer);
             fs::rename(&temp_path, &req.output_path).map_err(|error| error.to_string())?;
             Ok(decrypted_result)
