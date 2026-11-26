@@ -216,12 +216,12 @@ pub fn encrypt_reader_to_writer<R: Read, W: Write>(
         options.chunk_size,
     );
 
+    let compression_level = options.compression_level.unwrap_or(6).clamp(1, 22);
     let mut hashing_reader = HashingReader::new(reader, options);
     if compress {
-        let level = options.compression_level.unwrap_or(6).clamp(1, 22);
         let mut encoder = StreamingEncoder::new(
             &mut chunk_writer,
-            ZstdLevel::from_level(level),
+            ZstdLevel::from_level(compression_level),
         );
         io::copy(&mut hashing_reader, &mut encoder)
             .map_err(|error| MajikFileError::encryption_failed(Some(Box::new(error))))?;
