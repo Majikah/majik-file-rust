@@ -49,7 +49,8 @@ pub fn generate_random_bytes(len: usize) -> Result<Vec<u8>> {
         ));
     }
     let mut buf = vec![0u8; len];
-    SysRng.try_fill_bytes(&mut buf).map_err(|error| {
+    let mut rng = SysRng;
+    rng.try_fill_bytes(&mut buf).map_err(|error| {
         MajikFileError::encryption_failed(Some(Box::new(error)))
     })?;
     Ok(buf)
