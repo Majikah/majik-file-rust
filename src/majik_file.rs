@@ -551,7 +551,8 @@ impl MajikFile {
             kem_alg: CRYPTO_SUITE.kem_alg.to_string(),
             cipher_alg: CRYPTO_SUITE.cipher_alg.to_string(),
             compression_level: options.compression_level,
-            compression_alg: streamed.compression_alg,
+            // Built-in Zstandard remains the implicit/default codec, matching v2 JSON semantics.
+            compression_alg: None,
             timestamp: Some(now.clone()),
             last_update: Some(now),
             signature: None,
