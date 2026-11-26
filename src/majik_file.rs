@@ -14,9 +14,9 @@
 //! the [`SignatureProvider`] trait; the file only stores the serialized
 //! signature string.
 //!
-//! ## .mjkb v2
-//! `[4 "MJKB"][1 ver][12 IV][4 len BE][payload JSON][AES-GCM ciphertext]`
-//! with the explicit `z` compression flag and optional `ca` algorithm tag.
+//! ## .mjkb formats
+//! v1/v2 use a single AES-GCM ciphertext; v3 uses independently authenticated
+//! chunks and a final authenticated manifest. `MajikFile::create` writes v3.
 
 use std::any::Any;
 use std::borrow::Cow;
