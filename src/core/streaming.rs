@@ -926,10 +926,12 @@ mod tests {
 
         let mut source = Cursor::new(input.clone());
         let mut encrypted = Vec::new();
-        let mut encrypt_options = StreamingOptions::default();
-        encrypt_options.chunk_size = MIN_STREAM_CHUNK_SIZE;
-        encrypt_options.compression = Some(compression);
-        encrypt_options.total_bytes = Some(input.len() as u64);
+        let mut encrypt_options = StreamingOptions {
+            chunk_size: MIN_STREAM_CHUNK_SIZE,
+            compression: Some(compression),
+            total_bytes: Some(input.len() as u64),
+            ..StreamingOptions::default()
+        };
 
         let encrypted_result = encrypt_reader_to_writer(
             &mut source,
@@ -978,9 +980,11 @@ mod tests {
         let input = vec![0x5au8; MIN_STREAM_CHUNK_SIZE + 7];
         let mut source = Cursor::new(input);
         let mut encrypted = Vec::new();
-        let mut options = StreamingOptions::default();
-        options.chunk_size = MIN_STREAM_CHUNK_SIZE;
-        options.compression = Some(false);
+        let mut options = StreamingOptions {
+            chunk_size: MIN_STREAM_CHUNK_SIZE,
+            compression: Some(false),
+            ..StreamingOptions::default()
+        };
         encrypt_reader_to_writer(
             &mut source,
             &mut encrypted,
@@ -1045,9 +1049,11 @@ mod additional_tests {
 
         let mut source = Cursor::new(input.clone());
         let mut encrypted = Vec::new();
-        let mut encrypt_options = StreamingOptions::default();
-        encrypt_options.chunk_size = MIN_STREAM_CHUNK_SIZE;
-        encrypt_options.compression = Some(false);
+        let mut encrypt_options = StreamingOptions {
+            chunk_size: MIN_STREAM_CHUNK_SIZE,
+            compression: Some(false),
+            ..StreamingOptions::default()
+        };
         let result = encrypt_reader_to_writer(
             &mut source,
             &mut encrypted,
@@ -1084,9 +1090,11 @@ mod additional_tests {
         let input = vec![0x77u8; MIN_STREAM_CHUNK_SIZE + 11];
         let mut source = Cursor::new(input);
         let mut encrypted = Vec::new();
-        let mut options = StreamingOptions::default();
-        options.chunk_size = MIN_STREAM_CHUNK_SIZE;
-        options.compression = Some(false);
+        let mut options = StreamingOptions {
+            chunk_size: MIN_STREAM_CHUNK_SIZE,
+            compression: Some(false),
+            ..StreamingOptions::default()
+        };
         encrypt_reader_to_writer(
             &mut source,
             &mut encrypted,
@@ -1120,9 +1128,11 @@ mod additional_tests {
         let input = vec![0x23u8; MIN_STREAM_CHUNK_SIZE + 3];
         let mut source = Cursor::new(input);
         let mut encrypted = Vec::new();
-        let mut options = StreamingOptions::default();
-        options.chunk_size = MIN_STREAM_CHUNK_SIZE;
-        options.compression = Some(false);
+        let mut options = StreamingOptions {
+            chunk_size: MIN_STREAM_CHUNK_SIZE,
+            compression: Some(false),
+            ..StreamingOptions::default()
+        };
         encrypt_reader_to_writer(
             &mut source,
             &mut encrypted,
@@ -1153,9 +1163,11 @@ mod additional_tests {
         let input = vec![0x55u8; MIN_STREAM_CHUNK_SIZE + 2];
         let mut source = Cursor::new(input);
         let mut encrypted = Vec::new();
-        let mut encrypt_options = StreamingOptions::default();
-        encrypt_options.chunk_size = MIN_STREAM_CHUNK_SIZE;
-        encrypt_options.compression = Some(false);
+        let mut encrypt_options = StreamingOptions {
+            chunk_size: MIN_STREAM_CHUNK_SIZE,
+            compression: Some(false),
+            ..StreamingOptions::default()
+        };
         encrypt_reader_to_writer(
             &mut source,
             &mut encrypted,
@@ -1169,8 +1181,10 @@ mod additional_tests {
 
         let mut encrypted_source = Cursor::new(encrypted);
         let mut plaintext = Vec::new();
-        let mut decrypt_options = StreamingOptions::default();
-        decrypt_options.max_bytes = Some(1024);
+        let mut decrypt_options = StreamingOptions {
+            max_bytes: Some(1024),
+            ..StreamingOptions::default()
+        };
         assert!(decrypt_reader_to_writer(
             &mut encrypted_source,
             &mut plaintext,
