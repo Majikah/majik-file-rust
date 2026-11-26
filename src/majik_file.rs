@@ -487,7 +487,83 @@ impl MajikFile {
 
     // ── Create ─────────────────────────────────────────────────────────────
 
+    /// Create a new MJKB v3 file by default.
+    ///
+    /// This convenience API accepts in-memory bytes and therefore retains the
+    /// input and resulting container in memory. For very large files, use
+    /// encrypt_reader_to_writer or the Tauri path-based streaming command.
+    ///
+    /// Custom legacy compression codecs remain available through create_v2;
+    /// MJKB v3 currently standardizes streaming compression on Zstandard.
     pub fn create(options: MajikFileCreateOptions) -> Result<MajikFile> {
+        // Preserve historical custom-codec behavior until the v3 wire format
+        // defines an interoperable streaming contract for arbitrary codecs.
+        if options.compressor.is_some() {
+            return Self::create_v2(options);
+        }
+
+        MajikFileValidator::assert_user_id(Some(&options.user_id))?;
+        let input_size = options.data.len();
+        MajikFileValidator::assert_non_empty_data(input_size)?;
+        MajikFileValidator::assert_size_within_limit(
+            input_size,
+            MAX_FILE_SIZE_BYTES,
+            options.bypass_size_limit,
+        )?;
+
+        let mime_type = options.mime_type.clone().or_else(|| {
+            options
+                .original_name
+                .as_deref()
+                .and_then(infer_mime_type_from_filename)
+        });
+
+        let mut reader = Cursor::new(options.data);
+        let mut binary = Vec::new();
+        let mut stream_options = StreamingOptions {
+            compression_level: options.compression_level,
+            total_bytes: Some(input_size as u64),
+            ..StreamingOptions::default()
+        };
+        let streamed = encrypt_reader_to_writer(
+            &mut reader,
+            &mut binary,
+            &options.identity,
+            &options.recipients,
+            options.original_name.as_deref(),
+            mime_type.as_deref(),
+            &mut stream_options,
+        )?;
+
+        let now = now_iso();
+        let json = MajikFileJson {
+            id: options.id.unwrap_or_else(generate_uuid),
+            schema_version: FILE_SCHEMA_VERSION,
+            kind: FILE_KIND.to_string(),
+            user_id: options.user_id,
+            original_name: options.original_name,
+            mime_type,
+            size_original: streamed.original_bytes,
+            size_stored: binary.len() as u64,
+            file_hash: streamed.file_hash,
+            encryption_iv: streamed.encryption_iv,
+            participants: streamed.participants,
+            kem_alg: CRYPTO_SUITE.kem_alg.to_string(),
+            cipher_alg: CRYPTO_SUITE.cipher_alg.to_string(),
+            compression_level: options.compression_level,
+            compression_alg: streamed.compression_alg,
+            timestamp: Some(now.clone()),
+            last_update: Some(now),
+            signature: None,
+        };
+        Self::from_parts(json, Some(binary), streamed.is_group)
+    }
+
+    /// Explicitly create a legacy-compatible MJKB v2 file.
+    ///
+    /// Use this only when a downstream consumer has not yet implemented v3.
+    /// The standard create() API writes v3.
+    pub fn create_v2(options: MajikFileCreateOptions) -> Result<MajikFile> {
         MajikFileValidator::assert_user_id(Some(&options.user_id))?;
 
         let mime_type = options.mime_type.clone().or_else(|| {
@@ -535,6 +611,7 @@ impl MajikFile {
         };
         Self::from_parts(json, Some(core.binary), core.is_group)
     }
+
 
     pub fn create_and_sign<P: SignatureProvider>(
         options: MajikFileCreateOptions,
