@@ -8,8 +8,6 @@
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use structured_zstd::decoding::StreamingDecoder;
@@ -100,6 +98,7 @@ pub struct StreamingDecryptResult {
     pub file_hash: String,
     pub original_name: Option<String>,
     pub mime_type: Option<String>,
+    pub payload: MjkbPayloadV3,
 }
 
 /// Encrypt any reader to a writer using the MJKB v3 chunked format.
@@ -287,7 +286,7 @@ pub fn decrypt_reader_to_writer<R: Read, W: Write>(
         nonce_base,
         payload_hash,
         chunk_size,
-        options.cancellation,
+        None,
     );
     let mut hashing_writer = HashingWriter::new(writer, options);
 
@@ -321,6 +320,7 @@ pub fn decrypt_reader_to_writer<R: Read, W: Write>(
         file_hash: hex::encode(file_hash),
         original_name: payload.n().map(str::to_string),
         mime_type: payload.m().map(str::to_string),
+        payload,
     })
 }
 
