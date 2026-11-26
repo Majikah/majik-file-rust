@@ -152,8 +152,9 @@ pub fn encrypt_reader_to_writer<R: Read, W: Write>(
     let compress = options
         .compression
         .unwrap_or_else(|| should_compress_mime(mime_type));
-    let mut nonce_base = [0u8; IV_LENGTH];
-    nonce_base.copy_from_slice(&generate_random_bytes(IV_LENGTH)?);
+    let nonce_base: [u8; IV_LENGTH] = generate_random_bytes(IV_LENGTH)?
+        .try_into()
+        .expect("generate_random_bytes returns the requested length");
 
     let (aes_key, payload) = if !is_group {
         let encapsulation = ml_kem_encapsulate(&identity.ml_kem_public_key)?;
@@ -292,10 +293,18 @@ pub fn decrypt_reader_to_writer<R: Read, W: Write>(
     let mut hashing_writer = HashingWriter::new(writer, options);
 
     if payload.z() {
-        {
+        let decode_result = {
             let mut decoder = StreamingDecoder::new(&mut chunk_reader);
             io::copy(&mut decoder, &mut hashing_writer)
-                .map_err(|error| MajikFileError::decompression_failed(Some(Box::new(error))))?;
+        };
+        if let Err(error) = decode_result {
+            if chunk_reader.authentication_failed {
+                return Err(MajikFileError::decryption_failed(
+                    "MJKB v3 chunk or manifest authentication failed",
+                    Some(Box::new(error)),
+                ));
+            }
+            return Err(MajikFileError::decompression_failed(Some(Box::new(error))));
         }
         // A valid Zstandard frame must consume the entire compressed stream.
         // Force the chunk reader to its authenticated manifest and reject any
@@ -358,8 +367,9 @@ fn read_v3_header<R: Read>(reader: &mut R) -> Result<([u8; IV_LENGTH], Vec<u8>, 
         ));
     }
 
-    let mut nonce_base = [0u8; IV_LENGTH];
-    nonce_base.copy_from_slice(&header[5..5 + IV_LENGTH]);
+    let nonce_base: [u8; IV_LENGTH] = header[5..5 + IV_LENGTH]
+        .try_into()
+        .map_err(|_| MajikFileError::format_error("Invalid MJKB v3 nonce length"))?;
     let length_offset = 5 + IV_LENGTH;
     let payload_len = u32::from_be_bytes([
         header[length_offset],
@@ -567,6 +577,7 @@ struct ChunkDecryptReader<'a, R: Read> {
     manifest: Option<StreamManifest>,
     finished: bool,
     cancellation: Option<&'a AtomicBool>,
+    authentication_failed: bool,
 }
 
 impl<'a, R: Read> ChunkDecryptReader<'a, R> {
@@ -591,6 +602,7 @@ impl<'a, R: Read> ChunkDecryptReader<'a, R> {
             manifest: None,
             finished: false,
             cancellation,
+            authentication_failed: false,
         }
     }
 
@@ -627,10 +639,17 @@ impl<'a, R: Read> ChunkDecryptReader<'a, R> {
             let nonce = nonce_for(&self.nonce_base, self.chunk_count);
             let authenticated =
                 aes_gcm_decrypt_with_aad(self.key, &nonce, &tag, &aad).map_err(as_io_error)?;
-            if authenticated.as_deref() != Some(&[][..]) {
+            let Some(authenticated) = authenticated else {
+                self.authentication_failed = true;
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "MJKB v3 manifest authentication failed",
+                ));
+            };
+            if !authenticated.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MJKB v3 manifest plaintext must be empty",
                 ));
             }
 
@@ -675,13 +694,14 @@ impl<'a, R: Read> ChunkDecryptReader<'a, R> {
         let nonce = nonce_for(&self.nonce_base, self.chunk_count);
         let aad = chunk_aad(&self.payload_hash, self.chunk_count, plaintext_len);
         let plaintext = aes_gcm_decrypt_with_aad(self.key, &nonce, &ciphertext, &aad)
-            .map_err(as_io_error)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "MJKB v3 chunk authentication failed",
-                )
-            })?;
+            .map_err(as_io_error)?;
+        let Some(plaintext) = plaintext else {
+            self.authentication_failed = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MJKB v3 chunk authentication failed",
+            ));
+        };
         if plaintext.is_empty() || plaintext.len() > self.chunk_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
