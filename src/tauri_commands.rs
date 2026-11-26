@@ -46,7 +46,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::core::crypto::crypto_provider::generate_ml_kem_keypair;
@@ -149,6 +149,46 @@ pub struct DecryptWithMetadataResult {
     pub bytes: Vec<u8>,
     pub original_name: Option<String>,
     pub mime_type: Option<String>,
+}
+
+/// Result of decrypting a file path. Legacy v1/v2 formats are decoded with
+/// their existing one-shot AES-GCM implementation; v3 is streamed.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePathDecryptResult {
+    pub format_version: u8,
+    pub original_bytes: u64,
+    pub file_hash: String,
+    pub original_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub chunks: Option<u64>,
+}
+
+fn mjkb_content_len<R: Read + Seek>(reader: &mut R, file_len: u64) -> Result<u64, String> {
+    if file_len < 8 {
+        return Err("MJKB file is too short".to_string());
+    }
+    reader
+        .seek(SeekFrom::End(-8))
+        .map_err(|error| error.to_string())?;
+    let mut footer = [0u8; 8];
+    reader.read_exact(&mut footer).map_err(|error| error.to_string())?;
+    if &footer[4..8] != b"MJKS" {
+        return Ok(file_len);
+    }
+
+    let signature_len = u32::from_be_bytes(footer[0..4].try_into().unwrap()) as u64;
+    let trailer_len = signature_len
+        .checked_add(8)
+        .ok_or_else(|| "MJKS trailer length overflow".to_string())?;
+    let content_len = file_len
+        .checked_sub(trailer_len)
+        .filter(|length| *length >= 21)
+        .ok_or_else(|| "Malformed MJKS signature trailer".to_string())?;
+    if signature_len == 0 {
+        return Err("Malformed MJKS signature trailer: empty signature".to_string());
+    }
+    Ok(content_len)
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -365,18 +405,31 @@ pub async fn cmd_encrypt_file_streaming(
     .map_err(|error| error.to_string())?
 }
 
-/// Stream-decrypt an MJKB v3 file. The output is committed only after each
-/// chunk and the final manifest have authenticated successfully.
+/// Decrypt a file path with automatic MJKB version detection.
+///
+/// V3 is decrypted incrementally. V1/v2 retain their legacy whole-buffer
+/// AES-GCM format and are passed through MajikFile's existing decoder.
 #[tauri::command]
 pub async fn cmd_decrypt_file_streaming(
     req: StreamingDecryptRequest,
-) -> Result<crate::core::streaming::StreamingDecryptResult, String> {
+) -> Result<FilePathDecryptResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if req.output_path.exists() {
             return Err("Output file already exists".to_string());
         }
         let input = File::open(&req.input_path).map_err(|error| error.to_string())?;
+        let file_len = input.metadata().map_err(|error| error.to_string())?.len();
         let mut reader = BufReader::new(input);
+        let mut prefix = [0u8; 5];
+        reader.read_exact(&mut prefix).map_err(|error| {
+            format!("Unable to read MJKB header: {error}")
+        })?;
+        if &prefix[..4] != b"MJKB" {
+            return Err("Input does not have MJKB magic bytes".to_string());
+        }
+        let format_version = prefix[4];
+        reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+
         let temp_path = streaming_temp_path(&req.output_path)?;
         let result = (|| {
             let output = OpenOptions::new()
@@ -385,27 +438,72 @@ pub async fn cmd_decrypt_file_streaming(
                 .open(&temp_path)
                 .map_err(|error| error.to_string())?;
             let mut writer = BufWriter::new(output);
-            let mut options = StreamingOptions {
-                max_bytes: req.max_bytes,
-                ..StreamingOptions::default()
-            };
             let secret = Zeroizing::new(req.ml_kem_secret_key);
             let identity = MajikFileDecryptIdentity::new(
                 &req.fingerprint,
                 secret.as_slice(),
             );
-            let decrypted = decrypt_reader_to_writer(
-                &mut reader,
-                &mut writer,
-                identity,
-                &mut options,
-            )
-            .map_err(|error| error.to_string())?;
+
+            let decrypted_result = match format_version {
+                crate::core::crypto::constants::MJKB_VERSION_STREAMING => {
+                    let body_len = mjkb_content_len(&mut reader, file_len)?;
+                    reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+                    let mut limited_reader = reader.take(body_len);
+                    let mut options = StreamingOptions {
+                        max_bytes: req.max_bytes,
+                        ..StreamingOptions::default()
+                    };
+                    let decrypted = decrypt_reader_to_writer(
+                        &mut limited_reader,
+                        &mut writer,
+                        identity,
+                        &mut options,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    FilePathDecryptResult {
+                        format_version,
+                        original_bytes: decrypted.original_bytes,
+                        file_hash: decrypted.file_hash,
+                        original_name: decrypted.original_name,
+                        mime_type: decrypted.mime_type,
+                        chunks: Some(decrypted.chunks),
+                    }
+                }
+                crate::core::crypto::constants::MJKB_VERSION_LEGACY
+                | crate::core::crypto::constants::MJKB_VERSION => {
+                    reader.seek(SeekFrom::Start(0)).map_err(|error| error.to_string())?;
+                    let mut encrypted = Vec::new();
+                    reader.read_to_end(&mut encrypted).map_err(|error| error.to_string())?;
+                    let decrypted = MajikFile::decrypt_with_metadata_from(
+                        &encrypted,
+                        identity,
+                        None,
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    if req.max_bytes.is_some_and(|maximum| decrypted.bytes.len() as u64 > maximum) {
+                        return Err("Decrypted output exceeds configured maximum".to_string());
+                    }
+                    writer
+                        .write_all(&decrypted.bytes)
+                        .map_err(|error| error.to_string())?;
+                    FilePathDecryptResult {
+                        format_version,
+                        original_bytes: decrypted.bytes.len() as u64,
+                        file_hash: sha256_hex(&decrypted.bytes),
+                        original_name: decrypted.original_name,
+                        mime_type: decrypted.mime_type,
+                        chunks: None,
+                    }
+                }
+                other => return Err(format!("Unsupported MJKB format version: {other}")),
+            };
+
             writer.flush().map_err(|error| error.to_string())?;
             writer.get_ref().sync_all().map_err(|error| error.to_string())?;
             drop(writer);
             fs::rename(&temp_path, &req.output_path).map_err(|error| error.to_string())?;
-            Ok(decrypted)
+            Ok(decrypted_result)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp_path);
